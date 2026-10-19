@@ -57,6 +57,20 @@ class TestMinIntDtype:
 
 
 class TestParallelWorkManager:
+    def test_threads(self):
+        with core.ParallelWorkManager(0, worker_threads=3) as manager:
+            for _ in range(10):
+                manager.submit(core.update_progress, 1)
+        assert core.get_progress() == 10
+
+    def test_threads_failure_cleanup(self):
+        manager = core.ParallelWorkManager(0, worker_threads=2)
+        with pytest.raises(TypeError):  # noqa: PT012
+            with manager:
+                manager.submit(frozenset, 1)
+        assert not manager.progress_thread.is_alive()
+        assert all(f.done() for f in manager.futures)
+
     @pytest.mark.parametrize("total", [1, 10, 2**63])
     @pytest.mark.parametrize("workers", [0, 1])
     def test_one_future_progress(self, total, workers):

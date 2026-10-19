@@ -9,6 +9,7 @@ import math
 import multiprocessing
 import threading
 import time
+from concurrent.futures.process import BrokenProcessPool
 
 import humanfriendly
 import numpy as np
@@ -134,7 +135,7 @@ def wait_on_futures(futures):
         exception = future.exception()
         if exception is not None:
             cancel_futures(futures)
-            if isinstance(exception, cf.process.BrokenProcessPool):
+            if isinstance(exception, BrokenProcessPool):
                 raise RuntimeError(
                     "Worker process died: you may have run out of memory"
                 ) from exception
@@ -264,13 +265,19 @@ def setup_progress_counter(counter):
 
 
 class ParallelWorkManager(contextlib.AbstractContextManager):
-    def __init__(self, worker_processes=1, progress_config=None):
+    def __init__(
+        self, worker_processes=1, progress_config=None, *, worker_threads=None
+    ):
         # Need to specify this explicitly to suppport Macs and
         # for future proofing.
         ctx = multiprocessing.get_context("spawn")
         global _progress_counter
         _progress_counter = ctx.Value("Q", 0)
-        if worker_processes <= 0:
+        if worker_threads is not None:
+            if worker_threads < 1:
+                raise ValueError("worker_threads must be positive")
+            self.executor = cf.ThreadPoolExecutor(max_workers=worker_threads)
+        elif worker_processes <= 0:
             # NOTE: this is only for testing and debugging, not for
             # production. See note on the SynchronousExecutor class.
             self.executor = SynchronousExecutor()
@@ -327,23 +334,18 @@ class ParallelWorkManager(contextlib.AbstractContextManager):
             yield future.result()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is None:
-            wait_on_futures(self.futures)
-        else:
-            cancel_futures(self.futures)
-        # There's probably a much cleaner way of doing this with a Condition
-        # or something, but this seems to work OK for now. This setup might
-        # make small conversions a bit laggy as we wait on the sleep interval
-        # though.
-        with self.completed_lock:
-            self.completed = True
-        self.executor.shutdown(wait=False)
-        # FIXME there's currently some thing weird happening at the end of
-        # Encode 1D for 1kg-p3. The progress bar disappears, like we're
-        # setting a total of zero or something.
-        self.progress_thread.join()
-        self._update_progress()
-        self.progress_bar.close()
+        try:
+            if exc_type is None:
+                wait_on_futures(self.futures)
+            else:
+                cancel_futures(self.futures)
+        finally:
+            self.executor.shutdown(wait=True, cancel_futures=True)
+            with self.completed_lock:
+                self.completed = True
+            self.progress_thread.join()
+            self._update_progress()
+            self.progress_bar.close()
         return False
 
 

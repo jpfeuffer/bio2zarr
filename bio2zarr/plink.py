@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import pathlib
 
 import numpy as np
 import pandas as pd
@@ -311,15 +312,19 @@ def convert(
     worker_processes=core.DEFAULT_WORKER_PROCESSES,
     show_progress=False,
     zarr_format=None,
+    input_format="auto",
+    worker_threads=None,
+    ploidy_mode="metadata",
+    genome_build=None,
 ):
     """
-    Convert a PLINK fileset to VCF Zarr format.
+    Convert a PLINK 1 or PLINK 2 fileset to VCF Zarr format.
 
     Parameters
     ----------
     prefix : str or Path
         Path prefix for the PLINK fileset (i.e. the shared prefix of the
-        .bed, .bim, and .fam files).
+        .bed/.bim/.fam or .pgen/.pvar[.zst]/.psam files).
     out : str, Path, or None
         Output path for the Zarr store. The output format depends on the value:
 
@@ -345,12 +350,63 @@ def convert(
     zarr_format : int, optional
         Zarr format version of output (default: 2, or value of
         BIO2ZARR_DEFAULT_ZARR_FORMAT env var)
+    input_format : {"auto", "bed", "pgen"}
+        Select the input fileset. Auto detects the genotype file and rejects
+        ambiguous prefixes with both BED and PGEN files.
+    worker_threads : int, optional
+        PGEN-only thread count, mutually exclusive with worker_processes.
+        Native batch decoding releases the GIL. Each worker owns a reader and
+        writes disjoint chunk-aligned tiles.
+    ploidy_mode : {"metadata", "diploid"}
+        PGEN only: reconstruct human chromosome ploidy using PSAM sex and PAR
+        metadata (default), or retain pgenlib's duplicated diploid encoding.
+    genome_build : {"hg19", "hg38"}, optional
+        PAR boundaries for unsplit male X calls. Not needed with explicit
+        PAR1/PAR2 contigs. Unknown sex on X/Y is rejected in metadata mode.
+
+    Notes
+    -----
+    PGEN conversion requires ``bio2zarr[plink2]`` and exports hardcalls, not
+    dosages, phenotype, pedigree, or arbitrary PVAR annotations. PGEN does not
+    preserve the original phase flag of homozygous or missing calls.
 
     Returns
     -------
     zarr.Group
         The root group of the Zarr store containing the converted data.
     """
+    if input_format not in ("auto", "bed", "pgen"):
+        raise ValueError("input_format must be 'auto', 'bed', or 'pgen'")
+    if input_format == "auto":
+        has_pgen = pathlib.Path(str(prefix) + ".pgen").exists()
+        has_bed = pathlib.Path(str(prefix) + ".bed").exists()
+        if has_pgen and has_bed:
+            raise ValueError(
+                "Both BED and PGEN files exist; choose input_format='bed' or 'pgen'"
+            )
+        input_format = "pgen" if has_pgen else "bed"
+    if input_format == "pgen":
+        from bio2zarr import pgen  # noqa: PLC0415
+
+        return pgen.convert(
+            prefix,
+            out,
+            mode=mode,
+            variants_chunk_size=variants_chunk_size,
+            samples_chunk_size=samples_chunk_size,
+            worker_processes=worker_processes,
+            worker_threads=worker_threads,
+            show_progress=show_progress,
+            zarr_format=zarr_format,
+            ploidy_mode=ploidy_mode,
+            genome_build=genome_build,
+        )
+    if (
+        worker_threads is not None
+        or genome_build is not None
+        or ploidy_mode != "metadata"
+    ):
+        raise ValueError("Threads and ploidy/PAR options require PGEN input")
     plink_format = PlinkFormat(prefix)
     schema = plink_format.generate_schema(
         variants_chunk_size=variants_chunk_size,

@@ -9,8 +9,24 @@ root = p2z.convert(plink_prefix, vcz_path)
 ```
 
 This will convert the PLINK fileset with the given path prefix
-(i.e. the shared prefix of the .bed, .bim, and .fam files)
+(i.e. the shared prefix of the .bed/.bim/.fam or .pgen/.pvar/.psam files)
 to VCF Zarr stored at ``vcz_path``.
+
+For PLINK 2 with unsplit male X calls:
+
+```python
+root = p2z.convert(
+    plink_prefix,
+    vcz_path,
+    genome_build="hg38",
+    worker_threads=4,
+    variants_chunk_size=1000,
+    samples_chunk_size=1000,
+)
+```
+
+Install `bio2zarr[plink2]`. See {ref}`sec-plink2zarr` for ploidy, phasing,
+and hardcall-only conversion semantics.
 
 ## API reference
 

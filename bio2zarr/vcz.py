@@ -603,6 +603,8 @@ def encode(
     worker_processes=core.DEFAULT_WORKER_PROCESSES,
     show_progress=False,
     zarr_format=None,
+    writer_type=None,
+    worker_threads=None,
 ):
     """Encode a source format object into a Zarr store.
 
@@ -629,6 +631,11 @@ def encode(
     zarr_format : int, optional
         Zarr format version of output (default: 2, or value of
         BIO2ZARR_DEFAULT_ZARR_FORMAT env var)
+    writer_type : type, optional
+        Specialized VcfZarrWriter subclass for block-oriented source formats.
+    worker_threads : int, optional
+        Thread count for writers supporting threaded encoding, instead of
+        worker processes.
 
     Returns
     -------
@@ -637,17 +644,23 @@ def encode(
     """
     source_type = type(source_format)
     with open_zarr(zarr_path, mode=mode) as zr:
-        vzw = VcfZarrWriter(source_type, zr.dir, zarr_format=zarr_format)
+        if writer_type is None:
+            writer_type = VcfZarrWriter
+        vzw = writer_type(source_type, zr.dir, zarr_format=zarr_format)
         # Rough heuristic to split work up enough to keep utilisation high
-        target_num_partitions = max(1, worker_processes * 4)
+        target_num_partitions = max(1, (worker_threads or worker_processes) * 4)
         vzw.init(
             source_format,
             target_num_partitions=target_num_partitions,
             schema=schema,
         )
+        parallel_options = {}
+        if worker_threads is not None:
+            parallel_options["worker_threads"] = worker_threads
         vzw.encode_all_partitions(
             worker_processes=worker_processes,
             show_progress=show_progress,
+            **parallel_options,
         )
         vzw.finalise(show_progress)
         vzw.create_index()
@@ -878,6 +891,16 @@ class VcfZarrWriter:
         partition_path.mkdir(exist_ok=True)
         logger.info(f"Encoding partition {partition_index} to {partition_path}")
 
+        self.encode_partition_fields(partition_index)
+
+        final_path = self.partition_path(partition_index)
+        logger.info(f"Finalising {partition_index} at {final_path}")
+        if final_path.exists():
+            logger.warning(f"Removing existing partition at {final_path}")
+            shutil.rmtree(final_path)
+        os.rename(partition_path, final_path)
+
+    def encode_partition_fields(self, partition_index):
         all_field_names = [field.name for field in self.schema.fields]
         if "variant_id" in all_field_names:
             self.encode_id_partition(partition_index)
@@ -894,13 +917,6 @@ class VcfZarrWriter:
         if self.has_local_alleles():
             self.encode_local_alleles_partition(partition_index)
             self.encode_local_allele_fields_partition(partition_index)
-
-        final_path = self.partition_path(partition_index)
-        logger.info(f"Finalising {partition_index} at {final_path}")
-        if final_path.exists():
-            logger.warning(f"Removing existing partition at {final_path}")
-            shutil.rmtree(final_path)
-        os.rename(partition_path, final_path)
 
     def init_partition_array(self, partition_index, name):
         field_map = self.schema.field_map()
