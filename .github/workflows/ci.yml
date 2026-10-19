@@ -1,11 +1,13 @@
 name: CI
 
 on:
+  workflow_dispatch:
   merge_group:
   pull_request:
   push:
     branches:
       - main
+      - jpfeuffer-bgen-fork-ci
   schedule:
     # At 04:44 on Monday, see https://crontab.guru/
     - cron: "44 4 * * 1"
@@ -39,6 +41,7 @@ jobs:
     name: Test
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-14, ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13"]
@@ -104,6 +107,7 @@ jobs:
         run: |
           uv run pytest --cov=bio2zarr
       - name: Upload coverage to Coveralls
+        if: github.repository == 'sgkit-dev/bio2zarr'
         uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329  # v2.3.8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
