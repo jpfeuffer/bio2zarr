@@ -1,6 +1,6 @@
 # Unreleased
 
-- Add PLINK 2 PGEN/PVAR/PSAM hardcall conversion using optional pgenlib bindings,
+- Add PLINK 2 PGEN/PVAR/PSAM hardcall and dosage conversion using pgenlib bindings,
   metadata-based human ploidy/PAR planning, and chunk-aligned threaded encoding.
 
 # 0.2.1 2026-06-04

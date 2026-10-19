@@ -1,4 +1,4 @@
-"""PLINK 2 hardcall conversion with chunk-sized pgenlib batch reads."""
+"""PLINK 2 hardcall and dosage conversion with pgenlib batch reads."""
 
 import logging
 import os
@@ -50,13 +50,18 @@ def read_psam(path):
 
 class PgenFormat(plink.PlinkFormat):
     @core.requires_optional_dependency("pgenlib", "plink2")
-    def __init__(self, prefix, *, ploidy_mode="metadata", genome_build=None):
+    def __init__(
+        self, prefix, *, ploidy_mode="metadata", genome_build=None, dosages=True
+    ):
         import pgenlib  # noqa: PLC0415
 
         if ploidy_mode not in ("metadata", "diploid"):
             raise ValueError("ploidy_mode must be 'metadata' or 'diploid'")
         if genome_build not in (None, *PAR_INTERVALS):
             raise ValueError("genome_build must be 'hg19' or 'hg38'")
+        if not isinstance(dosages, bool):
+            raise ValueError("dosages must be a boolean")
+        self.dosages = dosages
         self.prefix = str(prefix)
         self.pgen_path = self.prefix + ".pgen"
         self.pvar_path = self.prefix + ".pvar"
@@ -102,6 +107,7 @@ class PgenFormat(plink.PlinkFormat):
                     "allele_2": [a[0] for a in self.alleles],
                 }
             )
+        self.max_alleles = int(self.allele_counts.max())
         self._validate_variants()
         self.contig_codes, self.contig_ids = pd.factorize(self.bim.contig)
         self.chromosomes = self.bim.contig.str.upper().str.removeprefix("CHR")
@@ -200,9 +206,7 @@ class PgenFormat(plink.PlinkFormat):
             os.fsencode(self.pgen_path),
             raw_sample_ct=self.num_samples,
             variant_ct=self.num_records,
-            allele_idx_offsets=(
-                self.allele_offsets if self.allele_counts.max() > 2 else None
-            ),
+            allele_idx_offsets=(self.allele_offsets if self.max_alleles > 2 else None),
             sample_subset=sample_subset,
         )
 
@@ -220,12 +224,13 @@ class PgenFormat(plink.PlinkFormat):
             "plink2_ploidy_mode": self.ploidy_mode,
             "plink2_genome_build": self.genome_build,
             "plink2_hardcall_phase_present": bool(self.has_phase),
+            "plink2_dosages": self.dosages,
         }
 
     def generate_schema(self, variants_chunk_size=None, samples_chunk_size=None):
         schema = super().generate_schema(variants_chunk_size, samples_chunk_size)
         schema.dimensions["ploidy"] = vcz.VcfZarrDimension.unchunked(self.max_ploidy)
-        num_alleles = int(self.allele_counts.max())
+        num_alleles = self.max_alleles
         schema.dimensions["alleles"] = vcz.VcfZarrDimension.unchunked(num_alleles)
         if num_alleles > 1:
             schema.dimensions["alt_alleles"] = vcz.VcfZarrDimension.unchunked(
@@ -238,6 +243,35 @@ class PgenFormat(plink.PlinkFormat):
                 field.dtype = core.min_int_dtype(-2, num_alleles - 1)
             elif field.name == "variant_position":
                 field.dtype = core.min_int_dtype(0, int(self.bim.position.max()))
+        if self.dosages and num_alleles > 1:
+            ds_dimensions = ["variants", "samples"]
+            if num_alleles > 2:
+                ds_dimensions.append("alt_alleles")
+                schema.dimensions["alt_alleles"].chunk_size = 1
+            schema.dimensions["FORMAT_HDS_dim"] = vcz.VcfZarrDimension(
+                self.max_ploidy * (num_alleles - 1), 1
+            )
+            schema.fields.extend(
+                [
+                    vcz.ZarrArraySpec(
+                        name="call_DS",
+                        dtype="f4",
+                        dimensions=ds_dimensions,
+                        description="Expected alternate allele counts",
+                        compressor=dict(zarr_utils.DEFAULT_COMPRESSOR_DOSAGES_CONFIG),
+                    ),
+                    vcz.ZarrArraySpec(
+                        name="call_HDS",
+                        dtype="f4",
+                        dimensions=["variants", "samples", "FORMAT_HDS_dim"],
+                        description=(
+                            "Alternate allele dosages in haplotype-major order; "
+                            "unphased dosages follow pgenlib's even split"
+                        ),
+                        compressor=dict(zarr_utils.DEFAULT_COMPRESSOR_DOSAGES_CONFIG),
+                    ),
+                ]
+            )
         return schema
 
     def iter_alleles_and_genotypes(self, start, stop, shape, num_alleles):
@@ -331,7 +365,9 @@ class PgenZarrWriter(vcz.VcfZarrWriter):
                     )
                 gt[:, :, 1][ploidy < 2] = constants.INT_FILL
                 gt[:, :, 0][ploidy == 0] = constants.INT_FILL
-                gt = gt[:, :, : self.source.max_ploidy]
+                gt = gt[:, :, : self.source.max_ploidy].astype(
+                    arrays["call_genotype"].dtype
+                )
                 phased = phase[:n] & (ploidy == 2)
                 data = {
                     "call_genotype": gt,
@@ -341,6 +377,100 @@ class PgenZarrWriter(vcz.VcfZarrWriter):
                 for name, value in data.items():
                     arrays[name][start:stop, sample_start:sample_stop] = value
                     core.update_progress(value.nbytes)
+                if "call_DS" in arrays:
+                    self.encode_dosages(
+                        reader, arrays, start, stop, sample_start, sample_stop, ploidy
+                    )
+
+    def encode_dosages(
+        self, reader, arrays, start, stop, sample_start, sample_stop, ploidy
+    ):
+        n = stop - start
+        samples = sample_stop - sample_start
+        counts = self.source.allele_counts[start:stop]
+        max_alt = self.schema.dimensions["alleles"].size - 1
+        raw = np.empty((n, 2 * samples), dtype=np.float32)
+        ds = np.empty((n, samples), dtype=np.float32)
+        totals = np.zeros((n, samples), dtype=np.float32)
+        sample_slice = slice(sample_start, sample_stop)
+        # Stream one alternate allele at a time: a highly multiallelic variant
+        # must not multiply per-worker memory by the global allele dimension.
+        for allele in range(1, max_alt + 1):
+            rows = np.flatnonzero(counts > allele)
+            ds.fill(constants.FLOAT32_FILL)
+            if len(rows):
+                if len(rows) == n:
+                    reader.read_phased_dosages_range(
+                        start, stop, raw, allele_idx=allele
+                    )
+                else:
+                    reader.read_phased_dosages_list(
+                        np.asarray(rows + start, dtype=np.uint32),
+                        raw[: len(rows)],
+                        allele_idx=allele,
+                    )
+                hds = raw[: len(rows)].reshape(len(rows), samples, 2)
+                missing = hds == -9
+                invalid = ~missing & (~np.isfinite(hds) | (hds < 0) | (hds > 1))
+                if np.any(invalid) or np.any(missing[:, :, 0] != missing[:, :, 1]):
+                    raise ValueError(f"Invalid PGEN dosage at variants {start}:{stop}")
+                local_ploidy = ploidy[rows]
+                present = ~missing[:, :, 0]
+                if np.any((local_ploidy == 0) & present):
+                    raise ValueError(
+                        f"Nonmissing female Y dosage at variants {start}:{stop}; "
+                        "check sex metadata or use ploidy_mode='diploid'"
+                    )
+                if np.any(
+                    (local_ploidy == 1) & present & (hds[:, :, 0] != hds[:, :, 1])
+                ):
+                    raise ValueError(
+                        "Unequal haploid haplotype dosages at "
+                        f"variants {start}:{stop}; "
+                        "check ploidy/PAR metadata or use ploidy_mode='diploid'"
+                    )
+                values = hds.sum(axis=2)
+                values[local_ploidy == 1] /= 2
+                totals[rows] += np.where(present, values, 0)
+                values[~present] = constants.FLOAT32_MISSING
+                values[local_ploidy == 0] = constants.FLOAT32_FILL
+                ds[rows] = values
+                # HDS is a variable-length VCF vector: pack each variant's
+                # actual alternate alleles, then pad the remaining vector.
+                for count in np.unique(counts[rows]):
+                    group = counts[rows] == count
+                    variant_rows = rows[group]
+                    hds_group = hds[group]
+                    group_ploidy = local_ploidy[group]
+                    group_missing = ~present[group]
+                    for hap in range(self.source.max_ploidy):
+                        value = hds_group[:, :, hap].copy()
+                        value[group_missing] = constants.FLOAT32_MISSING
+                        value[group_ploidy <= hap] = constants.FLOAT32_FILL
+                        column = hap * (int(count) - 1) + allele - 1
+                        arrays["call_HDS"].oindex[
+                            variant_rows + start, sample_slice, column
+                        ] = value
+                        core.update_progress(value.nbytes)
+            if max_alt == 1:
+                arrays["call_DS"][start:stop, sample_slice] = ds
+            else:
+                arrays["call_DS"][start:stop, sample_slice, allele - 1] = ds
+            core.update_progress(ds.nbytes)
+        # Empty HDS slots need explicit VCZ fill NaNs, not Zarr's zero fill.
+        width = self.schema.dimensions["FORMAT_HDS_dim"].size
+        fill = np.full((n, samples), constants.FLOAT32_FILL, dtype=np.float32)
+        for column in range(width):
+            rows = np.flatnonzero(column >= (counts - 1) * self.source.max_ploidy)
+            if len(rows):
+                arrays["call_HDS"].oindex[rows + start, sample_slice, column] = fill[
+                    : len(rows)
+                ]
+                core.update_progress(fill[: len(rows)].nbytes)
+        if np.any(totals > ploidy + 1e-6):
+            raise ValueError(
+                f"Alternate dosages exceed ploidy at variants {start}:{stop}"
+            )
 
     def encode_partition_fields(self, partition_index):
         self.prepare_partition(partition_index)
@@ -407,6 +537,7 @@ def convert(
     zarr_format=None,
     ploidy_mode="metadata",
     genome_build=None,
+    dosages=True,
 ):
     for name, value, minimum in (
         ("worker_processes", worker_processes, 0),
@@ -420,7 +551,9 @@ def convert(
             raise ValueError(f"{name} must be an integer >= {minimum}")
     if worker_processes and worker_threads is not None:
         raise ValueError("Choose worker_processes or worker_threads, not both")
-    source = PgenFormat(prefix, ploidy_mode=ploidy_mode, genome_build=genome_build)
+    source = PgenFormat(
+        prefix, ploidy_mode=ploidy_mode, genome_build=genome_build, dosages=dosages
+    )
     schema = source.generate_schema(variants_chunk_size, samples_chunk_size)
     schema.validate()
     options = dict(

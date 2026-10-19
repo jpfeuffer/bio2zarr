@@ -316,6 +316,7 @@ def convert(
     worker_threads=None,
     ploidy_mode="metadata",
     genome_build=None,
+    dosages=True,
 ):
     """
     Convert a PLINK 1 or PLINK 2 fileset to VCF Zarr format.
@@ -363,12 +364,16 @@ def convert(
     genome_build : {"hg19", "hg38"}, optional
         PAR boundaries for unsplit male X calls. Not needed with explicit
         PAR1/PAR2 contigs. Unknown sex on X/Y is rejected in metadata mode.
+    dosages : bool
+        PGEN only: export call_DS and call_HDS (default True). Native stored
+        dosages are retained; pgenlib supplies hardcall-derived values when
+        explicit dosages are absent. False selects hardcall-only conversion.
 
     Notes
     -----
-    PGEN conversion requires ``bio2zarr[plink2]`` and exports hardcalls, not
-    dosages, phenotype, pedigree, or arbitrary PVAR annotations. PGEN does not
-    preserve the original phase flag of homozygous or missing calls.
+    PGEN conversion requires ``bio2zarr[plink2]``. Phenotype, pedigree, and
+    arbitrary PVAR annotations are not exported. PGEN does not preserve the
+    original phase flag of homozygous or missing calls.
 
     Returns
     -------
@@ -400,13 +405,15 @@ def convert(
             zarr_format=zarr_format,
             ploidy_mode=ploidy_mode,
             genome_build=genome_build,
+            dosages=dosages,
         )
     if (
         worker_threads is not None
         or genome_build is not None
         or ploidy_mode != "metadata"
+        or not dosages
     ):
-        raise ValueError("Threads and ploidy/PAR options require PGEN input")
+        raise ValueError("Threads, dosage and ploidy/PAR options require PGEN input")
     plink_format = PlinkFormat(prefix)
     schema = plink_format.generate_schema(
         variants_chunk_size=variants_chunk_size,

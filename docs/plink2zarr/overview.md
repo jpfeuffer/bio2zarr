@@ -92,13 +92,55 @@ present, these flags follow pgenlib's representation. Without file-wide
 hardcall phase information, all phase flags are false. Haploid/zero-copy phase
 flags are always false.
 
+### Dosages
+
+By default, conversion also exports `call_DS` (expected alternate allele
+counts) and `call_HDS` (alternate allele counts per haplotype), using
+`pgenlib>=0.95.1`. Stored fractional dosages are preserved, including when the
+hardcall is missing. Hardcalls are never inferred from dosage values.
+
+When no explicit dosages are stored, pgenlib supplies values derived from the
+hardcalls. Unphased dosages are split evenly between the two haplotypes;
+hardcall-phase information is used when available, and explicitly stored phased
+dosages retain their haplotype values. HDS values do not imply that hardcalls
+were phased: `call_genotype_phased` describes hardcalls only.
+
+PGEN uses the diploid dosage scale even for haploid chromosomes. Metadata mode
+normalizes haploid DS from 0-2 to 0-1 and stores a single haplotype dosage.
+Unequal haplotype dosages on a reconstructed haploid call, and nonmissing
+dosages on female Y, are errors. Diploid mode preserves the native 0-2 scale.
+The fixed-point precision in PGEN is exactly representable by the output's
+float32 dtype.
+
+For multiallelic data, DS has an `alt_alleles` axis (omitted for biallelic
+datasets). HDS is a VCF-style vector with dimension `FORMAT_HDS_dim`:
+alternate alleles for haplotype 0, then alternate alleles for haplotype 1.
+Each variant's actual allele count determines packing; trailing slots and
+absent haplotypes receive VCZ fill NaNs, distinct from missing-data NaNs.
+Reference-only variants have only fill slots; an entirely reference-only
+dataset omits DS/HDS.
+
+Upstream pgenlib currently supports stored fractional dosages on biallelic
+variants. Multiallelic hardcall-derived DS/HDS are supported, but native
+multiallelic dosage records raise an explicit backend error, not a fallback
+to hardcalls.
+
+Use `--no-dosages` (Python: `dosages=False`) for explicitly hardcall-only
+conversion, avoiding the additional decoding, storage and compression work.
+This option deliberately omits any stored dosages.
+
 ### Parallel encoding
 
 Metadata and file-wide phasedness are read once, without decoding genotypes to
 discover output dimensions. Native batch reads release the GIL. Each thread owns
 an independent PGEN reader and writes disjoint variant-by-sample chunk tiles.
 Decoded working arrays scale with chunk dimensions, not the entire sample
-cohort. A bounded queue limits outstanding thread tasks.
+cohort. Dosages are streamed one alternate allele at a time, with unit-sized
+chunks on the DS alternate/HDS vector axes, so highly multiallelic sites do not
+multiply working memory by the global allele count.
+DS/HDS use bitshuffle before Zstandard compression, matching PGEN's limited
+fixed-point precision.
+A bounded queue limits outstanding thread tasks.
 Alternatively, `--worker-processes` uses the shared process-based encoder;
 do not combine it with `--worker-threads`.
 
@@ -107,10 +149,7 @@ repeat decompression of the same variant. Larger sample chunks reduce that
 overhead, at the cost of larger per-worker buffers. There is no claim that
 more threads always improve throughput; storage and compression can dominate.
 
-Only hardcalls and the basic variant/sample fields above are exported.
-Dosages, phased dosages, phenotype/pedigree columns, and additional PVAR
-annotations are **not** exported. In particular, a dosage-only call without a
-stored hardcall remains missing; dosages are never rounded into genotypes.
+Phenotype/pedigree columns and additional PVAR annotations are **not** exported.
 Directory and ZIP outputs are published only after encoding and indexing
 succeed.
 
@@ -120,5 +159,3 @@ phenotypes and pedigree information. These are planned as future enhancements.
 Please comment on [this issue](https://github.com/sgkit-dev/bio2zarr/issues/392)
 if you are interested in this functionality.
 :::
-
-

@@ -93,6 +93,7 @@ DEFAULT_PLINK_CONVERT_ARGS = dict(
     worker_threads=None,
     ploidy_mode="metadata",
     genome_build=None,
+    dosages=True,
 )
 
 

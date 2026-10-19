@@ -54,11 +54,11 @@ zipzarr = "bio2zarr.cli:zipzarr"
 [project.optional-dependencies]
 tskit = ["tskit>=1"]
 vcf = ["cyvcf2"]
-plink2 = ["pgenlib>=0.93"]
+plink2 = ["pgenlib>=0.95.1"]
 all = [
   "tskit>=1",
   "cyvcf2",
-  "pgenlib>=0.93"
+  "pgenlib>=0.95.1"
 ]
 
 [dependency-groups]
@@ -73,7 +73,7 @@ test = [
   "tqdm",
   "tskit>=1",
   "bed_reader",
-  "pgenlib>=0.93 ; sys_platform != 'win32'",
+  "pgenlib>=0.95.1 ; sys_platform != 'win32'",
   "cyvcf2 ; sys_platform != 'win32'",
   "xarray<2025.03.1",
   "dask[array]",

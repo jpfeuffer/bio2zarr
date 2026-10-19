@@ -26,7 +26,8 @@ root = p2z.convert(
 ```
 
 Install `bio2zarr[plink2]`. See {ref}`sec-plink2zarr` for ploidy, phasing,
-and hardcall-only conversion semantics.
+and dosage conversion semantics. DS/HDS are included by default; use
+`dosages=False` for explicitly hardcall-only conversion.
 
 ## API reference
 

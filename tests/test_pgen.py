@@ -9,7 +9,7 @@ import numpy.testing as nt
 import pytest
 import zarr
 
-from bio2zarr import cli, pgen, plink, vcf
+from bio2zarr import cli, constants, pgen, plink, vcf
 
 pgenlib = pytest.importorskip("pgenlib")
 
@@ -368,6 +368,7 @@ def test_variant_count_mismatch(fileset):
         (dict(worker_processes=-1), "worker_processes"),
         (dict(worker_processes=1, worker_threads=1), "not both"),
         (dict(variants_chunk_size=0), "chunk"),
+        (dict(dosages="yes"), "dosages must be a boolean"),
     ],
 )
 def test_invalid_options(fileset, options, match):
@@ -482,6 +483,7 @@ def test_decode_is_chunk_bounded(tmp_path, monkeypatch, phased):
     )
     native_open = pgen.PgenFormat.open_reader
     reads = []
+    dosage_reads = []
     opened = []
     closed = []
 
@@ -509,6 +511,12 @@ def test_decode_is_chunk_bounded(tmp_path, monkeypatch, phased):
             reads.append((start, stop, out.shape, self.samples))
             self.reader.read_alleles_and_phasepresent_range(start, stop, out, phase)
 
+        def read_phased_dosages_range(self, start, stop, out, allele_idx):
+            dosage_reads.append((start, stop, out.shape, self.samples))
+            self.reader.read_phased_dosages_range(
+                start, stop, out, allele_idx=allele_idx
+            )
+
     monkeypatch.setattr(
         pgen.PgenFormat,
         "open_reader",
@@ -519,9 +527,177 @@ def test_decode_is_chunk_bounded(tmp_path, monkeypatch, phased):
     assert not reads
     plink.convert(prefix, variants_chunk_size=2, samples_chunk_size=2, worker_threads=3)
     assert len(reads) == 9
+    assert dosage_reads == reads or sorted(dosage_reads) == sorted(reads)
     assert all(start % 2 == 0 and stop - start <= 2 for start, stop, _, _ in reads)
     assert all(
         shape == (stop - start, 2 * samples) for start, stop, shape, samples in reads
     )
     assert all(samples <= 2 for _, _, _, samples in reads)
     assert len(opened) == len(closed)
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+@pytest.mark.parametrize(
+    "workers", [{}, {"worker_threads": 3}, {"worker_processes": 2}]
+)
+def test_stored_phased_dosages(tmp_path, zarr_format, workers):
+    # Generated with PLINK 2 (15 Oct 2026):
+    # plink2 --vcf phased_dosages.vcf dosage=HDS --make-pgen --out phased_dosages
+    root = plink.convert(
+        "tests/data/pgen/phased_dosages",
+        tmp_path / "out",
+        variants_chunk_size=2,
+        samples_chunk_size=2,
+        zarr_format=zarr_format,
+        **workers,
+    )
+    expected = np.array(
+        [
+            [[0.125, 0.875], [0.125, 0.125], [np.nan, np.nan]],
+            [[0.25, 0.5], [0.875, 0.125], [0.75, 0.875]],
+            [[0, 0], [0.25, 0.75], [1, 1]],
+        ],
+        dtype=np.float32,
+    )
+    nt.assert_array_equal(root["call_HDS"][:], expected)
+    nt.assert_array_equal(root["call_DS"][:], expected.sum(axis=2))
+    assert root["call_DS"].dtype == np.dtype("f4")
+    assert root["call_HDS"].chunks == (2, 2, 1)
+    missing_bits = np.asarray(constants.FLOAT32_MISSING).view(np.uint32)
+    assert root["call_DS"][:].view(np.uint32)[0, 2] == missing_bits
+    # Stored dosage is preserved even when no hardcall could be made.
+    nt.assert_array_equal(root["call_genotype"][1, 0], [-1, -1])
+    assert root["call_DS"][1, 0] == 0.75
+
+
+def write_dosage_fileset(tmp_path, dosages, **metadata):
+    dosages = np.asarray(dosages, dtype=np.float32)
+    m, n = dosages.shape
+    prefix = write_fileset(tmp_path, np.zeros((m, n, 2), dtype=np.int32), **metadata)
+    with pgenlib.PgenWriter(
+        os.fsencode(str(prefix) + ".pgen"), n, variant_ct=m, dosage_present=True
+    ) as writer:
+        writer.append_dosages_batch(dosages)
+    return prefix
+
+
+@pytest.mark.parametrize(("chrom", "sexes"), [("MT", None), ("X", [1, 1, 1])])
+def test_haploid_dosage_scaling(tmp_path, chrom, sexes):
+    prefix = write_dosage_fileset(
+        tmp_path,
+        [[0.5, 1.5, -9]],
+        chroms=[chrom],
+        sexes=sexes,
+        positions=[5_000_000],
+    )
+    root = plink.convert(prefix, genome_build="hg38")
+    nt.assert_array_equal(root["call_DS"][:], [[0.25, 0.75, np.nan]])
+    nt.assert_array_equal(root["call_HDS"][:], [[[0.25], [0.75], [np.nan]]])
+    nt.assert_array_equal(root["call_genotype"][:], [[[-1], [-1], [-1]]])
+
+
+def test_female_y_dosage_without_hardcall(tmp_path):
+    prefix = write_dosage_fileset(tmp_path, [[0.5]], chroms=["Y"], sexes=[2])
+    with pytest.raises(ValueError, match="Nonmissing female Y dosage"):
+        plink.convert(prefix)
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_dosage_missing_and_padding(tmp_path, zarr_format):
+    prefix = write_fileset(
+        tmp_path,
+        [[[0, 2], [-9, -9]], [[1, 1], [-9, -9]], [[0, 0], [-9, -9]]],
+        alleles=[["A", "C", "G"], ["A", "C"], ["A", "."]],
+    )
+    root = plink.convert(
+        prefix,
+        worker_threads=3,
+        variants_chunk_size=2,
+        samples_chunk_size=1,
+        zarr_format=zarr_format,
+    )
+    missing, fill = constants.FLOAT32_MISSING, constants.FLOAT32_FILL
+    ds = np.array(
+        [
+            [[0, 1], [missing, missing]],
+            [[2, fill], [missing, fill]],
+            [[fill, fill], [fill, fill]],
+        ],
+        dtype=np.float32,
+    )
+    hds = np.array(
+        [
+            [[0, 0.5, 0, 0.5], [missing] * 4],
+            [[1, 1, fill, fill], [missing, missing, fill, fill]],
+            [[fill] * 4, [fill] * 4],
+        ],
+        dtype=np.float32,
+    )
+    nt.assert_array_equal(root["call_DS"][:].view(np.uint32), ds.view(np.uint32))
+    nt.assert_array_equal(root["call_HDS"][:].view(np.uint32), hds.view(np.uint32))
+    assert root["call_DS"].chunks == (2, 1, 1)
+
+
+def test_disable_dosages(fileset):
+    prefix, _, _ = fileset
+    root = plink.convert(prefix, dosages=False)
+    assert "call_DS" not in root
+    assert "call_HDS" not in root
+    assert not root.attrs["plink2_dosages"]
+
+
+def test_cli_disable_dosages(fileset, tmp_path):
+    prefix, _, _ = fileset
+    result = click.testing.CliRunner().invoke(
+        cli.plink2zarr_main,
+        ["convert", str(prefix), str(tmp_path / "output"), "--no-dosages", "-Q"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert "call_DS" not in zarr.open(tmp_path / "output")
+
+
+def test_unphased_dosages(tmp_path):
+    prefix = write_dosage_fileset(tmp_path, [[0.5, 1.5, 0.75, 0, -9]])
+    root = plink.convert(prefix)
+    expected = np.array([[0.5, 1.5, 0.75, 0, np.nan]], dtype=np.float32)
+    nt.assert_array_equal(root["call_DS"][:], expected)
+    nt.assert_array_equal(
+        root["call_HDS"][:], np.repeat(expected[:, :, None] / 2, 2, axis=2)
+    )
+    assert not root["call_genotype_phased"][:].any()
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -1, 1.5])
+def test_invalid_native_dosage(fileset, tmp_path, monkeypatch, bad_value):
+    prefix, _, _ = fileset
+    native_open = pgen.PgenFormat.open_reader
+
+    class Reader:
+        def __init__(self, source, subset=None):
+            self.reader = native_open(source, subset)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.reader.close()
+
+        def __getattr__(self, name):
+            return getattr(self.reader, name)
+
+        def read_phased_dosages_range(self, start, stop, out, allele_idx):
+            self.reader.read_phased_dosages_range(
+                start, stop, out, allele_idx=allele_idx
+            )
+            out[0, 0] = bad_value
+
+    monkeypatch.setattr(
+        pgen.PgenFormat,
+        "open_reader",
+        lambda source, subset=None: Reader(source, subset),
+    )
+    out = tmp_path / "output"
+    with pytest.raises(ValueError, match="Invalid PGEN dosage"):
+        plink.convert(prefix, out, worker_threads=2, variants_chunk_size=2)
+    assert not out.exists()

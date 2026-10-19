@@ -625,6 +625,11 @@ vcf2zarr_main.add_command(dencode_finalise)
     default=None,
     help="PGEN: PAR boundaries for unsplit male X calls.",
 )
+@click.option(
+    "--dosages/--no-dosages",
+    default=True,
+    help="PGEN: export DS and HDS, including stored dosages (default: enabled).",
+)
 def convert_plink(
     in_path,
     zarr_path,
@@ -639,12 +644,13 @@ def convert_plink(
     worker_threads,
     ploidy_mode,
     genome_build,
+    dosages,
 ):
     """
     Convert PLINK 1 BED/BIM/FAM or PLINK 2 PGEN/PVAR/PSAM to VCF Zarr.
 
-    IN_PATH is the shared fileset prefix. PGEN exports hardcalls, not dosages
-    or phenotype/pedigree annotations; requires bio2zarr[plink2].
+    IN_PATH is the shared fileset prefix. PGEN exports hardcalls and dosages,
+    not phenotype/pedigree annotations; requires bio2zarr[plink2].
     """
     setup_logging(verbose)
     check_overwrite_dir(zarr_path, force)
@@ -660,6 +666,7 @@ def convert_plink(
         worker_threads=worker_threads,
         ploidy_mode=ploidy_mode,
         genome_build=genome_build,
+        dosages=dosages,
     )
 
 
