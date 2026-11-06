@@ -832,7 +832,10 @@ def convert_bgen(
         max_ploidy=max_ploidy,
     )
     destination = storage.path(zarr_path)
-    if destination.exists():
+    if isinstance(destination, storage.S3Path):
+        check_overwrite_dir(destination, force)
+        bgen.convert(bgen_path, destination, **kwargs)
+    elif destination.exists():
         # Validate and encode before an overwrite can remove existing output.
         with storage.temporary_path(
             destination.parent, prefix=".bio2zarr-bgen-cli-"
@@ -841,7 +844,7 @@ def convert_bgen(
             root = bgen.convert(bgen_path, staged, **kwargs)
             root.store.close()
             check_overwrite_dir(destination, force)
-            vcz.publish_zarr(staged, destination)
+            storage.move(staged, destination)
     else:
         bgen.convert(bgen_path, destination, **kwargs)
 

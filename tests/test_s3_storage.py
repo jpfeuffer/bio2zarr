@@ -31,6 +31,18 @@ def minio(monkeypatch, tmp_path):
     bucket = "bio2zarr-test-" + uuid.uuid4().hex
     client.create_bucket(Bucket=bucket)
     monkeypatch.chdir(tmp_path)
+    copy_tree, move = storage.copy_tree, storage.move
+
+    def local_only(operation):
+        def checked(src, dest):
+            if storage.is_remote(src) or storage.is_remote(dest):
+                pytest.fail("Remote conversion must not copy data or trees")
+            return operation(src, dest)
+
+        return checked
+
+    monkeypatch.setattr(storage, "copy_tree", local_only(copy_tree))
+    monkeypatch.setattr(storage, "move", local_only(move))
     try:
         yield client, bucket
     finally:
@@ -77,6 +89,25 @@ def test_minio_vcf_end_to_end(minio, tmp_path, filename, zarr_format, direct):
 
 
 @pytest.mark.parametrize("zarr_format", [2, 3])
+@pytest.mark.parametrize(
+    "filename", ["empty.vcf.gz", "mixed_ploidy.vcf.gz", "field_type_combos.vcf.gz"]
+)
+def test_minio_direct_write_edge_cases(minio, zarr_format, filename):
+    uri = upload(minio, "vcf", filename).replace("s3://", "s3+http://")
+    out = f"s3://{minio[1]}/out"
+    kwargs = dict(
+        zarr_format=zarr_format,
+        variants_chunk_size=3,
+        samples_chunk_size=2,
+        worker_processes=2,
+        infer_shape=True,
+        batch_size=2,
+    )
+    expected = vcf_mod.convert([DATA / "vcf" / filename], **kwargs)
+    assert_zarr_equal(expected, vcf_mod.convert([uri], out, **kwargs))
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
 def test_minio_distributed_retry(minio, tmp_path, monkeypatch, zarr_format):
     bucket = minio[1]
     icf = f"s3://{bucket}/icf"
@@ -89,34 +120,34 @@ def test_minio_distributed_retry(minio, tmp_path, monkeypatch, zarr_format):
     summary = vcf_mod.encode_init(
         icf, out, 3, batch_size=2, variants_chunk_size=3, zarr_format=zarr_format
     )
-    original = storage.copy_tree
+    original = vcf_mod.BatchedVcfZarrWriter.encode_partition_fields
 
-    def fail_publication(src, dest):
-        if dest == storage.path(out + "/wip/partitions/p0"):
-            with (dest / "partial").open("w") as f:
-                f.write("partial")
-            raise OSError("injected publication failure")
-        return original(src, dest)
+    def fail_partition(writer, index):
+        original(writer, index)
+        if index == 0:
+            raise OSError("injected partition failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(storage, "copy_tree", fail_publication)
+        patch.setattr(
+            vcf_mod.BatchedVcfZarrWriter, "encode_partition_fields", fail_partition
+        )
         with pytest.raises(OSError, match="injected"):
             vcf_mod.encode_partition(out, 0)
     with pytest.raises(FileNotFoundError, match="Partitions not encoded"):
         vcf_mod.encode_finalise(out)
-    assert storage.path(out + "/wip/partitions/wip_p0").exists()
+    assert not storage.path(out + "/wip/partitions/p0/.complete").exists()
+    with pytest.raises(ValueError, match="conversion is incomplete"):
+        zarr_utils.open_vcf_zarr(out)
     for j in range(summary.num_partitions):
         vcf_mod.encode_partition(out, j)
     vcf_mod.encode_partition(out, 0)
-    assert not storage.path(out + "/wip/partitions/p0/partial").exists()
+    assert not storage.path(out + "/wip/partitions/wip_p0").exists()
 
-    def fail_finalise(src, dest):
-        if dest == storage.path(out + "/variant_allele"):
-            raise OSError("injected finalise failure")
-        return original(src, dest)
+    def fail_index(self):
+        raise OSError("injected index failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(storage, "copy_tree", fail_finalise)
+        patch.setattr(vcz.VcfZarrIndexer, "create_index", fail_index)
         with pytest.raises(OSError, match="injected"):
             vcf_mod.encode_finalise(out)
     assert storage.path(out + "/wip/partitions/p0/.complete").exists()
@@ -174,21 +205,19 @@ def test_minio_bgen_validation_leaves_output_absent(minio):
     assert not storage.path(out).exists()
 
 
-def test_minio_bgen_partial_publication_is_not_readable(minio, monkeypatch):
+def test_minio_bgen_partial_conversion_is_not_readable(minio, monkeypatch):
     uri = upload(minio, "bgen", "haplotypes.bgen")
     out = storage.path(f"s3://{minio[1]}/out")
-    copy = storage.copy_tree
+    encode = bgen.BgenZarrWriter.encode_partition_fields
 
-    def fail(src, dest):
-        if dest == out:
-            copy(src, dest)
-            raise OSError("injected publication failure")
-        return copy(src, dest)
+    def fail(writer, index):
+        encode(writer, index)
+        raise OSError("injected conversion failure")
 
-    monkeypatch.setattr(storage, "copy_tree", fail)
+    monkeypatch.setattr(bgen.BgenZarrWriter, "encode_partition_fields", fail)
     with pytest.raises(OSError, match="injected"):
         bgen.convert(uri, out)
-    assert (out / "wip" / ".publishing").exists()
+    assert (out / "wip" / ".incomplete").exists()
     with pytest.raises(ValueError, match="conversion is incomplete"):
         zarr_utils.open_vcf_zarr(out)
 
