@@ -22,6 +22,19 @@ def protocol(value):
     return value.protocol if isinstance(value, UPath) else get_protocol(str(value))
 
 
+def is_remote(value):
+    return protocol(value) not in ("", "file")
+
+
+def filesystem_path(value):
+    """Resolve filesystem operations independently of converter capabilities."""
+    if isinstance(value, UPath):
+        return value
+    if protocol(value) == S3_PROTOCOL or not is_remote(value):
+        return path(value)
+    return UPath(value)
+
+
 def path(value):
     scheme = protocol(value)
     if scheme == S3_PROTOCOL:
@@ -57,14 +70,16 @@ def mkdir(value, *, parents=False, exist_ok=False):
 
 
 def remove_tree(value):
-    value = path(value)
-    if isinstance(value, S3Path):
+    if is_remote(value):
+        value = filesystem_path(value)
+        if not value.name or value.path.rstrip("/") == value.drive:
+            raise ValueError("Remote deletion requires an object prefix")
         # Match only descendants: a similarly named neighbouring prefix is not ours.
         objects = value.fs.find(value.path.rstrip("/") + "/")
         if objects:
             value.fs.rm(objects)
     else:
-        shutil.rmtree(value)
+        shutil.rmtree(path(value))
 
 
 def file_size(value):

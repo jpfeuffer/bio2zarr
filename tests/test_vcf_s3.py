@@ -333,10 +333,30 @@ def test_storage_protocol(value, expected):
     assert storage.protocol(value) == expected
 
 
-@pytest.mark.parametrize("scheme", sorted(storage.S3_PROTOCOLS))
-def test_local_only_output_rejects_s3_protocol(scheme):
-    with pytest.raises(click.UsageError, match="must be a local path"):
-        cli.check_overwrite_dir(f"{scheme}://bucket/output", False, allow_s3=False)
+@pytest.mark.parametrize("scheme", ["s3", "gs", "az"])
+def test_overwrite_remote_storage_is_protocol_independent(monkeypatch, scheme):
+    remote = UPath(f"{scheme}://bucket/output")
+    monkeypatch.setattr(type(remote), "exists", lambda self: True)
+    removed = []
+    monkeypatch.setattr(storage, "remove_tree", removed.append)
+    cli.check_overwrite_dir(remote, force=True)
+    assert removed == [remote]
+
+
+@pytest.mark.parametrize("scheme", ["s3", "gs", "az"])
+def test_zip_command_rejects_remote_destination_before_overwrite(
+    monkeypatch, tmp_path, scheme
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.setattr(
+        cli, "check_overwrite_dir", lambda *args: pytest.fail("overwrite attempted")
+    )
+    result = click.testing.CliRunner().invoke(
+        cli.zipzarr, [str(source), f"{scheme}://bucket/output", "--keep"]
+    )
+    assert result.exit_code == 2
+    assert "ZIP input/output must be local paths" in result.output
 
 
 @pytest.mark.parametrize("scheme", ["s3", "s3+http", "s3+https"])
