@@ -142,6 +142,125 @@ time (rather than retaining a decompressed ICF chunk for every field).
 `dencode-init --batch-size N` records this choice for subsequent workers;
 the existing distributed lifecycle is unchanged.
 
+## S3 input and output storage
+
+Install `bio2zarr[vcf,s3]` to use `s3://bucket/key` VCF/BCF input and
+`s3://bucket/prefix` ICF and final Zarr storage (formats 2 and 3):
+
+```bash
+vcf2zarr convert s3://my-bucket/input/sample.vcf.gz s3://my-bucket/output/sample.vcz --max-ploidy 2
+vcf2zarr explode s3://my-bucket/input/sample.vcf.gz s3://my-bucket/work/sample.icf
+vcf2zarr encode s3://my-bucket/work/sample.icf s3://my-bucket/output/sample.vcz --batch-size 64
+vcf2zarr convert sample.vcf.gz sample.vcz --temp-icf-dir s3://my-bucket/tmp
+```
+
+VCF/BCF data uses HTSlib's native S3 protocol and ranged reads, without presigned
+URLs. The cyvcf2/HTSlib build must include its S3 and HTTP plugins; unsupported
+protocols and authentication failures propagate without a fallback download.
+BCF indexes also use native S3. VCF indexes (TBI or CSI) are copied to a small,
+unique temporary local directory and removed when the reader closes: cyvcf2's
+tabix API otherwise caches remote indexes in the working directory. This also
+isolates concurrent inputs with identically named indexes. Index statistics
+and ICF data use `universal_pathlib` (`UPath`) backed by `s3fs`, keeping the
+same pathlib-style operations as local files. Indexed input retains the local
+partition semantics.
+
+Configure credentials for **both** readers. HTSlib supports environment variables
+such as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and
+`AWS_DEFAULT_REGION`, and shared credentials files/profiles (depending on its
+version/build). Do not assume it implements botocore's complete credential
+provider chain or automatic IAM-role refresh. Long-running jobs using temporary
+credentials need an externally refreshed shared credentials file supported by
+the installed HTSlib, or credentials valid for the entire job; environment
+credentials inherited by a running worker do not refresh themselves.
+`s3fs` uses its standard AWS credential provider chain separately.
+
+For S3-compatible endpoints, `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` configures
+`s3fs`; configure native reads separately with `HTS_S3_HOST=host:port` and, when
+needed, `HTS_S3_ADDRESS_STYLE=path`. Native `s3://` defaults to HTTPS;
+`s3+http://bucket/key` explicitly selects HTTP for local services, and
+`s3+https://bucket/key` explicitly selects HTTPS. Every distributed worker needs
+the same credentials and endpoint configuration. Credentials and signed URLs
+are not written to ICF or conversion metadata. Buckets must already exist. Use a
+dedicated, otherwise-empty prefix for each ICF run; a prefix containing existing
+data is rejected.
+
+`--icf-path` retains intermediate data; `--temp-icf-dir` chooses a local parent
+directory or S3 parent prefix for temporary ICF. The latter creates a unique
+run prefix and removes only that prefix on success or failure. These options
+are mutually exclusive, and neither may be used with no-ICF conversion.
+`explode`, `inspect`, `mkschema`, `encode` and all distributed ICF commands
+accept S3 ICF prefixes. Final VCZ output, reopening, inspection and
+`create-index` also accept S3 prefixes. ZIP input/output remains local-only.
+
+S3 has no atomic directory rename. Partition retries invalidate their completion
+marker before rewriting; publication copies all objects before writing the
+marker and removing the working prefix. Finalisation requires every marker,
+copies chunks and array metadata while retaining partition sources for retry,
+and removes `wip` only after every array succeeds. Bio2zarr reopening/inspection
+rejects remote destinations that still contain `wip`. Do not read a destination
+while conversion/finalisation is running; an interrupted finalisation can be
+retried with `dencode-finalise`. Concurrent writers to the same partition or
+destination are not supported. Use distinct empty prefixes for independent jobs.
+Cleanup targets only exact descendant keys, never neighbouring prefixes or
+buckets. `--force` removes existing data only within the requested prefix.
+
+### BGEN and PLINK
+
+Install `bio2zarr[bgen,s3]` for native bgen-limix S3 reads:
+
+```bash
+bgen2zarr convert s3://my-bucket/input/sample.bgen s3://my-bucket/output/sample.vcz
+```
+
+BGEN input, existing `.metafile` sidecars and Oxford `.sample` files may be
+remote. If no metafile exists, the converter builds a temporary **local** index
+from the native remote reader. Sidecars are checked for count and timestamp
+consistency, never overwritten. Native reads use bgen-limix's AWS credential
+support and `AWS_ENDPOINT_URL` for S3-compatible endpoints; for BGEN use
+`s3://` even for HTTP endpoints. Remote output shares the writer above and is
+staged under a unique sibling prefix before publication. On S3 publication is
+a copy, not an atomic rename; a `wip/.publishing` marker blocks Bio2zarr reopening
+until the copy succeeds. Failed publication can be rerun with explicit
+`--force`; do not read while it is being published.
+Malformed data is rejected without publishing a destination, including the
+unsorted tail of the bundled `example.8bits.bgen` fixture.
+
+Local PLINK BED inputs can write to S3 through the shared writer. PGEN conversion
+is not included in this layer. TODO: enable PGEN S3 input when pgenlib delivers
+the native remote-read support on its roadmap; do not download it implicitly.
+
+### Reproducible local MinIO tests
+
+The integration suite uses an externally running MinIO (not Moto). Start a
+dedicated disposable container, with a dynamically assigned localhost port:
+
+```bash
+docker run -d --name bio2zarr-minio-test -p 127.0.0.1::9000 \
+  -e MINIO_ROOT_USER=bio2zarr-local \
+  -e MINIO_ROOT_PASSWORD=bio2zarr-local-test \
+  quay.io/minio/minio:latest server /data
+docker port bio2zarr-minio-test 9000
+```
+
+Use the reported port below and wait until
+`curl --fail http://127.0.0.1:PORT/minio/health/ready` succeeds:
+
+```bash
+uv sync --python 3.12 --group test --extra all
+AWS_ACCESS_KEY_ID=bio2zarr-local \
+AWS_SECRET_ACCESS_KEY=bio2zarr-local-test \
+AWS_DEFAULT_REGION=us-east-1 \
+BIO2ZARR_MINIO_ENDPOINT=http://127.0.0.1:PORT \
+uv run pytest tests/test_s3_storage.py --no-cov
+docker rm -f bio2zarr-minio-test
+```
+
+These credentials are disposable test credentials only, never production
+configuration. Tests create uniquely named buckets and remove only their own
+data/buckets. Without `BIO2ZARR_MINIO_ENDPOINT` the integration suite is skipped;
+the existing Moto tests remain available. No CI configuration is changed.
+
 ## Local alleles
 
 As discussed in our [preprint](

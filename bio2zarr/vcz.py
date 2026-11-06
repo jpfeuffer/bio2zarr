@@ -3,7 +3,6 @@ import contextlib
 import dataclasses
 import json
 import logging
-import os
 import pathlib
 import shutil
 import tempfile
@@ -11,7 +10,7 @@ import tempfile
 import numpy as np
 import zarr
 
-from bio2zarr import constants, core, provenance, zarr_utils
+from bio2zarr import constants, core, provenance, storage, zarr_utils
 
 logger = logging.getLogger(__name__)
 
@@ -572,14 +571,28 @@ class VcfZarrWriteSummary(core.JsonDataclass):
 
 @dataclasses.dataclass
 class ZarrWriteResult:
-    dir: pathlib.Path
+    dir: pathlib.Path | storage.S3Path
     root: zarr.Group | None = None
 
 
-def local_zarr_path(path):
-    if "://" in str(path):
-        raise ValueError("Final VCZ output must be a local path")
-    return pathlib.Path(path)
+def output_path(path):
+    result = storage.path(path)
+    if isinstance(result, storage.S3Path) and result.suffix == ".zip":
+        raise ValueError("ZIP output must be a local path")
+    return result
+
+
+def publish_zarr(src, dest):
+    """Publish a staged store, marking incomplete remote copies explicitly."""
+    if isinstance(dest, storage.S3Path):
+        marker = dest / "wip" / ".publishing"
+        with marker.open("w") as f:
+            f.write("")
+        storage.copy_tree(src, dest)
+        marker.unlink()
+        storage.remove_tree(src)
+    else:
+        storage.move(src, dest)
 
 
 @contextlib.contextmanager
@@ -594,22 +607,22 @@ def open_zarr(zarr_path, mode="r"):
     - otherwise: uses path directly, root is a directory-backed group
     """
     if zarr_path is not None:
-        zarr_path = local_zarr_path(zarr_path)
+        zarr_path = output_path(zarr_path)
     if zarr_path is None:
         with tempfile.TemporaryDirectory(prefix="bio2zarr_") as tmp:
             result = ZarrWriteResult(dir=pathlib.Path(tmp) / "zarr")
             yield result
             result.root = zarr_utils.dir_to_memory_store(result.dir, mode=mode)
-    elif pathlib.Path(zarr_path).suffix == ".zip":
+    elif zarr_path.suffix == ".zip":
         result = ZarrWriteResult(dir=pathlib.Path(zarr_path).with_suffix(""))
         yield result
         zarr_utils.zip_zarr(result.dir, zarr_path)
         shutil.rmtree(result.dir)
         result.root = zarr.open(zarr.storage.ZipStore(zarr_path, mode="r"), mode=mode)
     else:
-        result = ZarrWriteResult(dir=pathlib.Path(zarr_path))
+        result = ZarrWriteResult(dir=zarr_path)
         yield result
-        result.root = zarr.open(result.dir, mode=mode)
+        result.root = zarr.open(storage.zarr_store(result.dir), mode=mode)
 
 
 def encode(
@@ -680,7 +693,7 @@ def encode(
 class VcfZarrWriter:
     def __init__(self, source_type, path, zarr_format=None):
         self.source_type = source_type
-        self.path = local_zarr_path(path)
+        self.path = output_path(path)
         self.zarr_format = zarr_format
         self.wip_path = self.path / "wip"
         self.arrays_path = self.wip_path / "arrays"
@@ -739,7 +752,7 @@ class VcfZarrWriter:
             provenance={"source": f"bio2zarr-{provenance.__version__}"},
         )
 
-        self.path.mkdir()
+        storage.mkdir(self.path)
         root = zarr_utils.open_zarr_append(self.path, zarr_format=self.zarr_format)
         root.attrs.update(
             {
@@ -756,9 +769,9 @@ class VcfZarrWriter:
         if self.source.contigs is not None:
             self.encode_contigs(root)
 
-        self.wip_path.mkdir()
-        self.arrays_path.mkdir()
-        self.partitions_path.mkdir()
+        storage.mkdir(self.wip_path)
+        storage.mkdir(self.arrays_path)
+        storage.mkdir(self.partitions_path)
         root = zarr_utils.open_zarr_append(
             self.arrays_path, zarr_format=self.zarr_format
         )
@@ -769,7 +782,7 @@ class VcfZarrWriter:
             total_chunks += a.nchunks
 
         logger.info("Writing WIP metadata")
-        with open(self.wip_path / "metadata.json", "w") as f:
+        with (self.wip_path / "metadata.json").open("w") as f:
             json.dump(self.metadata.asdict(), f, indent=4)
 
         return VcfZarrWriteSummary(
@@ -877,9 +890,13 @@ class VcfZarrWriter:
 
     def load_metadata(self):
         if self.metadata is None:
-            with open(self.wip_path / "metadata.json") as f:
+            with (self.wip_path / "metadata.json").open() as f:
                 self.metadata = VcfZarrWriterMetadata.fromdict(json.load(f))
             self.source = self.source_type(self.metadata.source_path)
+        if self.zarr_format is None:
+            self.zarr_format = zarr.open_group(
+                storage.zarr_store(self.arrays_path), mode="r"
+            ).metadata.zarr_format
 
     def partition_path(self, partition_index):
         return self.partitions_path / f"p{partition_index}"
@@ -898,17 +915,29 @@ class VcfZarrWriter:
         if partition_index < 0 or partition_index >= self.num_partitions:
             raise ValueError("Partition index not in the valid range")
         partition_path = self.wip_partition_path(partition_index)
-        partition_path.mkdir(exist_ok=True)
+        final_path = self.partition_path(partition_index)
+        if isinstance(self.path, storage.S3Path):
+            marker = final_path / ".complete"
+            if marker.exists():
+                marker.unlink()
+            if partition_path.exists():
+                storage.remove_tree(partition_path)
+        storage.mkdir(partition_path, exist_ok=True)
         logger.info(f"Encoding partition {partition_index} to {partition_path}")
 
         self.encode_partition_fields(partition_index)
 
-        final_path = self.partition_path(partition_index)
         logger.info(f"Finalising {partition_index} at {final_path}")
         if final_path.exists():
             logger.warning(f"Removing existing partition at {final_path}")
-            shutil.rmtree(final_path)
-        os.rename(partition_path, final_path)
+            storage.remove_tree(final_path)
+        if isinstance(self.path, storage.S3Path):
+            storage.copy_tree(partition_path, final_path)
+            with (final_path / ".complete").open("w") as f:
+                f.write("")
+            storage.remove_tree(partition_path)
+        else:
+            storage.move(partition_path, final_path)
 
     def encode_partition_fields(self, partition_index):
         all_field_names = [field.name for field in self.schema.fields]
@@ -935,8 +964,8 @@ class VcfZarrWriter:
         src = self.arrays_path / array_spec.name
         # Overwrite any existing WIP files
         wip_path = self.wip_partition_array_path(partition_index, array_spec.name)
-        shutil.copytree(src, wip_path, dirs_exist_ok=True)
-        return zarr.open_array(store=wip_path, mode="a")
+        storage.copy_tree(src, wip_path)
+        return zarr.open_array(store=storage.zarr_store(wip_path), mode="a")
 
     def init_partition_array(self, partition_index, name):
         array = self.open_partition_array(partition_index, name)
@@ -1007,7 +1036,9 @@ class VcfZarrWriter:
         gt_mask = self.init_partition_array(partition_index, "call_genotype_mask")
         # Read back in the genotypes so we can compute the mask
         gt_array = zarr.open_array(
-            store=self.wip_partition_array_path(partition_index, "call_genotype"),
+            store=storage.zarr_store(
+                self.wip_partition_array_path(partition_index, "call_genotype")
+            ),
             mode="r",
         )
         if gt_array.shape[1] > 0:  # has samples
@@ -1025,7 +1056,9 @@ class VcfZarrWriter:
         call_LA = self.init_partition_array(partition_index, "call_LA")
 
         gt_array = zarr.open_array(
-            store=self.wip_partition_array_path(partition_index, "call_genotype"),
+            store=storage.zarr_store(
+                self.wip_partition_array_path(partition_index, "call_genotype")
+            ),
             mode="r",
         )
         for genotypes in core.first_dim_slice_iter(
@@ -1039,7 +1072,9 @@ class VcfZarrWriter:
     def encode_local_allele_fields_partition(self, partition_index):
         partition = self.metadata.partitions[partition_index]
         la_array = zarr.open_array(
-            store=self.wip_partition_array_path(partition_index, "call_LA"),
+            store=storage.zarr_store(
+                self.wip_partition_array_path(partition_index, "call_LA")
+            ),
             mode="r",
         )
         # We got through the localisable fields one-by-one so that we don't need to
@@ -1114,7 +1149,7 @@ class VcfZarrWriter:
     def finalise_array(self, name):
         logger.info(f"Finalising {name}")
         final_path = self.path / name
-        if final_path.exists():
+        if final_path.exists() and not isinstance(self.path, storage.S3Path):
             # NEEDS TEST
             raise ValueError(f"Array {name} already exists")
         for partition in range(self.num_partitions):
@@ -1128,7 +1163,10 @@ class VcfZarrWriter:
             )
         # Finally, once all the chunks have moved into the arrays dir,
         # we move it out of wip
-        os.rename(self.arrays_path / name, self.path / name)
+        if isinstance(self.path, storage.S3Path):
+            storage.copy_tree(self.arrays_path / name, final_path)
+        else:
+            storage.move(self.arrays_path / name, final_path)
         core.update_progress(1)
 
     def finalise(self, show_progress=False):
@@ -1138,7 +1176,13 @@ class VcfZarrWriter:
         missing = []
         # TODO may need a progress bar here
         for partition_id in range(self.num_partitions):
-            if not self.partition_path(partition_id).exists():
+            partition = self.partition_path(partition_id)
+            complete = (
+                (partition / ".complete").exists()
+                if isinstance(self.path, storage.S3Path)
+                else partition.exists()
+            )
+            if not complete:
                 missing.append(partition_id)
         if len(missing) > 0:
             raise FileNotFoundError(f"Partitions not encoded: {missing}")
@@ -1161,7 +1205,7 @@ class VcfZarrWriter:
             for field in self.schema.fields:
                 pwm.submit(self.finalise_array, field.name)
         logger.debug(f"Removing {self.wip_path}")
-        shutil.rmtree(self.wip_path)
+        storage.remove_tree(self.wip_path)
 
     #######################
     # index
@@ -1227,7 +1271,9 @@ class VcfZarrWriter:
         total_bytes = 0
         for array_spec in self.schema.fields:
             # Open the array definition to get the total size
-            total_bytes += zarr.open(self.arrays_path / array_spec.name).nbytes
+            total_bytes += zarr.open(
+                storage.zarr_store(self.arrays_path / array_spec.name)
+            ).nbytes
 
         progress_config = core.ProgressConfig(
             total=total_bytes,
@@ -1242,7 +1288,7 @@ class VcfZarrWriter:
 
 class VcfZarr:
     def __init__(self, path):
-        self.path = pathlib.Path(path)
+        self.path = storage.path(path)
         self.root = zarr_utils.open_vcf_zarr(self.path)
 
     def summary_table(self):
@@ -1281,7 +1327,7 @@ class VcfZarrIndexer:
     """
 
     def __init__(self, store):
-        self.store = store
+        self.store = storage.zarr_store(store)
 
     def create_index(self):
         """Create an index to support efficient region queries."""
@@ -1337,6 +1383,7 @@ class VcfZarrIndexer:
             dtype=index.dtype,
             compressor={"id": "blosc", "cname": "zstd", "clevel": 9, "shuffle": 0},
             fill_value=None,
+            overwrite=True,
             dimension_names=[
                 "region_index_values",
                 "region_index_fields",

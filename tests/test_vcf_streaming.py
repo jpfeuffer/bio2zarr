@@ -24,6 +24,12 @@ def assert_zarr_equal(left, right):
         assert a.dtype == b.dtype, name
         assert a.shape == b.shape, name
         assert a.chunks == b.chunks, name
+        assert getattr(a.metadata, "dimension_names", None) == getattr(
+            b.metadata, "dimension_names", None
+        ), name
+        assert vcf_mod.zarr_utils.get_compressor_config(
+            a
+        ) == vcf_mod.zarr_utils.get_compressor_config(b), name
         x, y = a[:], b[:]
         if a.dtype.kind == "f":
             x = x.view(f"u{a.dtype.itemsize}")
@@ -507,22 +513,23 @@ def test_cli_shape_and_bounds(tmp_path):
     assert vcf_mod.zarr_utils.open_vcf_zarr(out)["variant_allele"].shape == (9, 5)
 
 
-def test_nonlocal_output_rejected_before_overwrite():
-    result = click.testing.CliRunner().invoke(
-        cli.vcf2zarr_main,
-        [
-            "convert",
-            "tests/data/vcf/sample.vcf.gz",
-            "remote://bucket/existing",
-            "--max-ploidy",
-            "2",
-            "--force",
-        ],
-        catch_exceptions=False,
-    )
+def test_s3_zip_output_rejected_before_overwrite():
+    with mock.patch.object(cli.storage.S3Path, "exists", side_effect=AssertionError):
+        result = click.testing.CliRunner().invoke(
+            cli.vcf2zarr_main,
+            [
+                "convert",
+                "tests/data/vcf/sample.vcf.gz",
+                "s3://bucket/existing.zip",
+                "--max-ploidy",
+                "2",
+                "--force",
+            ],
+            catch_exceptions=False,
+        )
     assert result.exit_code == 2
-    assert "Final VCZ output must be a local path" in result.output
-    with pytest.raises(ValueError, match="Final VCZ output must be a local path"):
+    assert "ZIP output must be a local path" in result.output
+    with pytest.raises(ValueError, match="ZIP output must be a local path"):
         vcf_mod.convert(
-            ["tests/data/vcf/sample.vcf.gz"], "remote://bucket/existing", max_ploidy=2
+            ["tests/data/vcf/sample.vcf.gz"], "s3://bucket/existing.zip", max_ploidy=2
         )

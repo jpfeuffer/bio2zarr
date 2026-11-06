@@ -53,12 +53,14 @@ so they do not enable a single-pass conversion.
 To choose temporary intermediate storage in the conventional path:
 ```python
 root = v2z.convert(
-    [vcf_path],
-    temp_icf_dir="/path/to/temp",
+    ["s3://my-bucket/input/sample.vcf.gz"],
+    "s3://my-bucket/output/sample.vcz",
+    temp_icf_dir="s3://my-bucket/tmp",
 )
 ```
 
-See the overview for batch-memory semantics.
+See the overview for S3 credentials, endpoint configuration and batch-memory
+semantics.
 
 ## API reference
 

@@ -2,14 +2,13 @@ import logging
 import os
 import pathlib
 import shutil
-import tempfile
 
 import click
 import coloredlogs
 import numcodecs
 import tabulate
 
-from . import bgen, core, plink, provenance, vcf_utils, zarr_utils
+from . import bgen, core, plink, provenance, storage, vcf_utils, vcz, zarr_utils
 from . import tskit as tskit_mod
 from . import vcf as vcf_mod
 
@@ -25,23 +24,34 @@ class NaturalOrderGroup(click.Group):
         return self.commands.keys()
 
 
+class StoragePath(click.Path):
+    def convert(self, value, param, ctx):
+        if str(value).startswith(("s3://", "s3+http://", "s3+https://")):
+            try:
+                vcf_utils.input_path(value)
+            except ValueError as e:
+                self.fail(str(e), param, ctx)
+            return str(value)
+        return super().convert(value, param, ctx)
+
+
 # Common arguments/options
 vcfs = click.argument(
-    "vcfs", nargs=-1, required=True, type=click.Path(exists=True, dir_okay=False)
+    "vcfs", nargs=-1, required=True, type=StoragePath(exists=True, dir_okay=False)
 )
 
 new_icf_path = click.argument(
-    "icf_path", type=click.Path(file_okay=False, dir_okay=True)
+    "icf_path", type=StoragePath(file_okay=False, dir_okay=True)
 )
 
 icf_path = click.argument(
-    "icf_path", type=click.Path(exists=True, file_okay=False, dir_okay=True)
+    "icf_path", type=StoragePath(exists=True, file_okay=False, dir_okay=True)
 )
 
-new_zarr_path = click.argument("zarr_path", type=click.Path())
+new_zarr_path = click.argument("zarr_path", type=StoragePath())
 
 zarr_path = click.argument(
-    "zarr_path", type=click.Path(exists=True, file_okay=False, dir_okay=True)
+    "zarr_path", type=StoragePath(exists=True, file_okay=False, dir_okay=True)
 )
 
 zarr_format = click.option(
@@ -214,8 +224,12 @@ def setup_logging(verbosity):
     coloredlogs.install(level=level)
 
 
-def check_overwrite_dir(path, force):
-    path = pathlib.Path(path)
+def check_overwrite_dir(path, force, *, allow_s3=True):
+    if str(path).startswith(("s3://", "s3+http://", "s3+https://")) and not allow_s3:
+        raise click.UsageError("Final VCZ output must be a local path")
+    path = storage.path(path)
+    if isinstance(path, storage.S3Path) and path.suffix == ".zip":
+        raise click.UsageError("ZIP output must be a local path")
     if path.exists():
         if not force:
             click.confirm(
@@ -225,6 +239,9 @@ def check_overwrite_dir(path, force):
         # These trees can be mondo-big and on slow file systems, so it's entirely
         # feasible that the delete would fail or be killed. This makes it less likely
         # that partially deleted paths are mistaken for good paths.
+        if isinstance(path, storage.S3Path):
+            storage.remove_tree(path)
+            return
         tmp_delete_path = path.with_suffix(f"{path.suffix}.{os.getpid()}.DELETING")
         logger.info(f"Deleting {path} (renamed to {tmp_delete_path} while in progress)")
         os.rename(path, tmp_delete_path)
@@ -281,7 +298,7 @@ def explode(
     Convert VCF(s) to intermediate columnar format
     """
     setup_logging(verbose)
-    check_overwrite_dir(icf_path, force)
+    check_overwrite_dir(icf_path, force, allow_s3=True)
     vcf_mod.explode(
         icf_path,
         vcfs,
@@ -320,7 +337,7 @@ def dexplode_init(
     over some number of paritions.
     """
     setup_logging(verbose)
-    check_overwrite_dir(icf_path, force)
+    check_overwrite_dir(icf_path, force, allow_s3=True)
     check_partitions(num_partitions)
     work_summary = vcf_mod.explode_init(
         icf_path,
@@ -365,7 +382,7 @@ def dexplode_finalise(icf_path, verbose):
 
 
 @click.command
-@click.argument("path", type=click.Path(exists=True))
+@click.argument("path", type=StoragePath(exists=True))
 @verbose
 def inspect(path, verbose):
     """
@@ -578,15 +595,15 @@ def dencode_finalise(zarr_path, verbose, progress):
 )
 @click.option(
     "--icf-path",
-    type=click.Path(file_okay=False, dir_okay=True),
+    type=StoragePath(),
     default=None,
-    help="Retain intermediate data at a local directory.",
+    help="Retain intermediate data at a local directory or S3 prefix.",
 )
 @click.option(
     "--temp-icf-dir",
-    type=click.Path(file_okay=False, dir_okay=True),
+    type=StoragePath(),
     default=None,
-    help="Parent local directory for automatically removed temporary ICF.",
+    help="Parent local directory or S3 prefix for automatically removed temporary ICF.",
 )
 def convert_vcf(
     vcfs,
@@ -631,10 +648,6 @@ def convert_vcf(
         options["icf_path"] = icf_path
     if temp_icf_dir is not None:
         options["temp_icf_dir"] = temp_icf_dir
-    try:
-        vcf_mod.vcz.local_zarr_path(zarr_path)
-    except ValueError as e:
-        raise click.UsageError(str(e)) from e
     check_overwrite_dir(zarr_path, force)
     vcf_mod.convert(
         vcfs,
@@ -739,7 +752,7 @@ plink2zarr_main.add_command(convert_plink)
 
 
 @click.command(name="convert")
-@click.argument("bgen_path", type=click.Path(exists=True, dir_okay=False))
+@click.argument("bgen_path", type=StoragePath(exists=True, dir_okay=False))
 @new_zarr_path
 @click.option(
     "--probabilities/--no-probabilities",
@@ -776,12 +789,12 @@ plink2zarr_main.add_command(convert_plink)
 )
 @click.option(
     "--sample-ids",
-    type=click.Path(exists=True, dir_okay=False),
+    type=StoragePath(exists=True, dir_okay=False),
     help="UTF-8 file with one sample ID per line, in BGEN sample order.",
 )
 @click.option(
     "--sample-file",
-    type=click.Path(exists=True, dir_okay=False),
+    type=StoragePath(exists=True, dir_okay=False),
     help="Oxford .sample file in BGEN sample order; overrides embedded IDs. "
     "Only IDs are imported, not phenotypes/covariates. Exclusive with --sample-ids.",
 )
@@ -856,7 +869,7 @@ def convert_bgen(
         )
     ids = None
     if sample_ids is not None:
-        with open(sample_ids, encoding="utf-8") as f:
+        with storage.path(sample_ids).open(encoding="utf-8") as f:
             ids = f.read().splitlines()
     kwargs = dict(
         sample_file=sample_file,
@@ -876,17 +889,17 @@ def convert_bgen(
         probability_model=probability_model,
         max_ploidy=max_ploidy,
     )
-    destination = pathlib.Path(zarr_path)
+    destination = storage.path(zarr_path)
     if destination.exists():
         # Validate and encode before an overwrite can remove existing output.
-        with tempfile.TemporaryDirectory(
-            prefix=".bio2zarr-bgen-cli-", dir=destination.parent
+        with storage.temporary_path(
+            destination.parent, prefix=".bio2zarr-bgen-cli-"
         ) as tmp:
-            staged = pathlib.Path(tmp) / destination.name
+            staged = tmp / destination.name
             root = bgen.convert(bgen_path, staged, **kwargs)
             root.store.close()
             check_overwrite_dir(destination, force)
-            os.rename(staged, destination)
+            vcz.publish_zarr(staged, destination)
     else:
         bgen.convert(bgen_path, destination, **kwargs)
 
@@ -996,7 +1009,7 @@ def zipzarr(src, dest, unzip, keep, force, verbose, progress):
                     "Provide DEST explicitly."
                 )
             dest = str(src_path.with_suffix(""))
-        check_overwrite_dir(dest, force)
+        check_overwrite_dir(dest, force, allow_s3=False)
         logger.info(f"Unzipping {src} -> {dest}")
         zarr_utils.unzip_zarr(src, dest, show_progress=progress)
         if not keep:
