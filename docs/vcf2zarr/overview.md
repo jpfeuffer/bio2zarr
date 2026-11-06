@@ -208,7 +208,7 @@ destination are not supported. Use distinct empty prefixes for independent jobs.
 Cleanup targets only exact descendant keys, never neighbouring prefixes or
 buckets. `--force` removes existing data only within the requested prefix.
 
-### BGEN and PLINK
+### BGEN
 
 Install `bio2zarr[bgen,s3]` for native bgen-limix S3 reads:
 
@@ -232,8 +232,27 @@ confirmation/`--force` policy: existing output is removed before encoding,
 so it is not retained if the replacement fails. Local directory/ZIP output
 retains its staging-and-rename behavior.
 
-Local PLINK BED inputs can write to S3 through the shared writer. PGEN conversion
-is not included in this layer. TODO: enable PGEN S3 input when pgenlib delivers
+### PLINK 1 BED/BIM/FAM
+
+PLINK 1 binary filesets (`.bed`, `.bim`, `.fam`) remain supported by
+`plink2zarr convert`. Their input reader is unchanged and currently requires
+local files; native S3 BED input is not implemented. Local filesets can write
+directly to S3 through the shared Zarr writer:
+
+```bash
+plink2zarr convert /local/fileset s3://my-bucket/output/fileset.vcz
+```
+
+Local BED-to-S3 conversion is covered by the real MinIO integration suite in
+Zarr formats 2 and 3 with spawned workers, comparing all output arrays,
+attributes, dimensions, compression settings and region indexes against local
+output. Existing PLINK 1 tests also check decoding and compatibility with
+PLINK-generated VCF data.
+
+### PLINK 2 PGEN
+
+PGEN conversion is developed separately and is not included in this layer.
+TODO: enable PGEN S3 input when pgenlib delivers
 the native remote-read support on its roadmap; do not download it implicitly.
 
 ### Reproducible local MinIO tests
