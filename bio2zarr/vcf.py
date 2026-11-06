@@ -1,9 +1,12 @@
 import collections
 import contextlib
+import copy
 import dataclasses
 import json
 import logging
 import math
+import multiprocessing
+import os
 import pathlib
 import pickle
 import re
@@ -1334,6 +1337,100 @@ def validate_positive_int(name, value):
         raise ValueError(f"{name} must be a positive integer")
 
 
+def feed_vcf_byte_range(connection, path, header, start, stop):
+    try:
+        with connection, open(path, "rb") as source:
+            with os.fdopen(os.dup(connection.fileno()), "wb") as target:
+                target.write(header)
+                if start:
+                    source.seek(start - 1)
+                    if source.read(1) != b"\n":
+                        source.readline()
+                while source.tell() < stop:
+                    line = source.readline()
+                    if not line:
+                        break
+                    if not line.startswith(b"#"):
+                        target.write(line)
+    except BrokenPipeError:
+        # A failed or cancelled parser closes its input before the feeder finishes.
+        return
+
+
+@core.requires_optional_dependency("cyvcf2", "vcf")
+def iter_vcf_byte_range(path, start, stop):
+    """Parse records whose first byte belongs to [start, stop), without spooling."""
+    import cyvcf2  # noqa: PLC0415
+
+    with vcf_utils.VcfFile(path) as header:
+        header_bytes = header.vcf.raw_header.encode("utf-8")
+        contig = header.sequence_names[0]
+    ctx = multiprocessing.get_context("spawn")
+    read_end, write_end = ctx.Pipe(duplex=False)
+    # cyvcf2 can block holding the GIL, so a thread cannot safely feed its pipe.
+    producer = ctx.Process(
+        target=feed_vcf_byte_range,
+        args=(write_end, path, header_bytes, start, stop),
+    )
+    producer.start()
+    write_end.close()
+    try:
+        with read_end, os.fdopen(os.dup(read_end.fileno()), "rb") as source:
+            parser = cyvcf2.VCF(source)
+            try:
+                for variant in parser:
+                    if variant.CHROM != contig:
+                        raise ValueError("Multi-contig VCFs must be indexed")
+                    yield variant
+            finally:
+                parser.close()
+    finally:
+        producer.join()
+    if producer.exitcode != 0:
+        raise RuntimeError(
+            f"VCF byte-range feeder failed with exit code {producer.exitcode}"
+        )
+
+
+def scan_dimension_partition(
+    metadata, partition, byte_range, max_ploidy, max_alleles, budget
+):
+    transformers = {
+        f.full_name: VcfValueTransformer.factory(f, metadata.num_samples)
+        for f in metadata.fields
+    }
+    count = 0
+    last_position = None
+    with contextlib.ExitStack() as stack:
+        if byte_range is None:
+            file = stack.enter_context(vcf_utils.VcfFile(partition.vcf_path))
+            variants = file.variants(partition.region)
+        else:
+            variants = stack.enter_context(
+                contextlib.closing(iter_vcf_byte_range(partition.vcf_path, *byte_range))
+            )
+        for variant in variants:
+            if max_alleles is not None and len(variant.ALT) + 1 > max_alleles:
+                raise ValueError(
+                    f"Allele count {len(variant.ALT) + 1} at "
+                    f"{variant.CHROM}:{variant.POS} exceeds "
+                    f"max_alleles={max_alleles} (including REF)"
+                )
+            values = variant_values(variant, metadata, genotypes=max_ploidy is None)
+            row_bytes = 0
+            for name, value in values.items():
+                transformed = transformers[name].transform_and_update_bounds(value)
+                row_bytes += value_nbytes(transformed)
+                if row_bytes > budget:
+                    raise ValueError(
+                        f"VCF row at {variant.CHROM}:{variant.POS} exceeds "
+                        f"max_batch_bytes={budget}"
+                    )
+            count += 1
+            last_position = variant.POS
+    return count, last_position, [f.summary for f in metadata.fields]
+
+
 def scan_vcf_dimensions(
     vcfs,
     *,
@@ -1351,6 +1448,8 @@ def scan_vcf_dimensions(
     bounds the allele count including REF and is checked during discovery.
     Returned summaries describe observed widths, not padded output widths.
     Repeat any desired bounds when passing this result to convert.
+    Local plain VCFs use byte ranges when workers are requested. Compressed
+    unindexed inputs are scanned serially; indexed inputs use indexed regions.
     """
     if max_ploidy is not None:
         validate_positive_int("max_ploidy", max_ploidy)
@@ -1364,38 +1463,66 @@ def scan_vcf_dimensions(
         paths, show_progress, max(1, worker_processes * 4), worker_processes
     )
     check_field_clobbering(metadata)
-    transformers = {
-        f.full_name: VcfValueTransformer.factory(f, metadata.num_samples)
-        for f in metadata.fields
-    }
     expected_records = metadata.num_records
-    total = 0
-    for partition in metadata.partitions:
-        count = 0
-        last_position = None
+    jobs = []
+    for index, partition in enumerate(metadata.partitions):
+        ranges = [None]
         with vcf_utils.VcfFile(partition.vcf_path) as file:
-            for variant in file.variants(partition.region):
-                if max_alleles is not None and len(variant.ALT) + 1 > max_alleles:
-                    raise ValueError(
-                        f"Allele count {len(variant.ALT) + 1} at "
-                        f"{variant.CHROM}:{variant.POS} exceeds "
-                        f"max_alleles={max_alleles} (including REF)"
+            if worker_processes > 0 and file.index is None:
+                path = pathlib.Path(partition.vcf_path)
+                with path.open("rb") as source:
+                    magic = source.read(2)
+                plain = magic == b"##"
+                if plain:
+                    size = path.stat().st_size
+                    boundaries = [
+                        size * j // worker_processes
+                        for j in range(worker_processes + 1)
+                    ]
+                    ranges = list(zip(boundaries[:-1], boundaries[1:]))
+                else:
+                    logger.warning(
+                        "Unindexed %s input %s: prescan of this file "
+                        "will be serial; use plain VCF or indexed BGZF "
+                        "for parallel prescanning.",
+                        "gzip VCF" if magic == b"\x1f\x8b" else "VCF/BCF",
+                        path,
                     )
-                values = variant_values(variant, metadata, genotypes=max_ploidy is None)
-                row_bytes = 0
-                for name, value in values.items():
-                    transformed = transformers[name].transform_and_update_bounds(value)
-                    row_bytes += value_nbytes(transformed)
-                    if row_bytes > max_batch_bytes:
-                        raise ValueError(
-                            f"VCF row at {variant.CHROM}:{variant.POS} exceeds "
-                            f"max_batch_bytes={max_batch_bytes}"
-                        )
-                count += 1
-                last_position = variant.POS
-        partition.num_records = count
-        partition.region.end = last_position
-        total += count
+        jobs.extend(
+            (index, copy.deepcopy(partition), byte_range) for byte_range in ranges
+        )
+    for partition in metadata.partitions:
+        partition.num_records = 0
+        partition.region.end = None
+    progress = core.ProgressConfig(
+        total=len(jobs), units="regions", title="Dimensions", show=show_progress
+    )
+    with core.ParallelWorkManager(worker_processes, progress) as pwm:
+        futures = [
+            (
+                index,
+                pwm.submit(
+                    scan_dimension_partition,
+                    copy.deepcopy(metadata),
+                    partition,
+                    byte_range,
+                    max_ploidy,
+                    max_alleles,
+                    max_batch_bytes,
+                ),
+            )
+            for index, partition, byte_range in jobs
+        ]
+        for index, future in futures:
+            count, last_position, summaries = future.result()
+            partition = metadata.partitions[index]
+            partition.num_records += count
+            if last_position is not None:
+                partition.region.end = max(partition.region.end or 0, last_position)
+            for field, summary in zip(metadata.fields, summaries):
+                field.summary.update(summary)
+            core.update_progress(1)
+    total = sum(p.num_records for p in metadata.partitions)
     if np.isfinite(expected_records) and total != expected_records:
         raise ValueError(
             f"VCF record count does not match index: {total} != {expected_records}"

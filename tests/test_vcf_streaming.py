@@ -1,3 +1,4 @@
+import gzip
 import json
 import sys
 from unittest import mock
@@ -101,6 +102,149 @@ def test_reusable_dimensions():
             [path], infer_shape=True, dimension_metadata=dimensions
         )
     assert result["call_genotype"].shape[2] == 3
+
+
+def plain_scan_fixture(path, newline="\n", final_newline=True):
+    header = (
+        "##fileformat=VCFv4.3\n##contig=<ID=1>\n"
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        '##INFO=<ID=TEXT,Number=1,Type=String,Description="Text">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts\n"
+    )
+    rows = [
+        f"1\t{i}\t.\tA\tC\t.\tPASS\tTEXT={'x' * (i * 37)}\tGT\t"
+        + ("0/1/1" if i == 9 else "0")
+        for i in range(1, 10)
+    ]
+    text = header + "\n".join(rows) + ("\n" if final_newline else "")
+    path.write_bytes(text.replace("\n", newline).encode())
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("final_newline", [False, True])
+def test_plain_byte_ranges_exact_boundaries(tmp_path, newline, final_newline):
+    path = tmp_path / "input.vcf"
+    plain_scan_fixture(path, newline, final_newline)
+    expected = list(range(1, 10))
+    data = path.read_bytes()
+    offsets = {0, 1, len(data), len(data) // 2}
+    offsets.update(i for i, byte in enumerate(data) if byte == ord("\n"))
+    offsets.update(i + 1 for i, byte in enumerate(data) if byte == ord("\n"))
+    for boundary in sorted(offsets):
+        actual = []
+        for start, stop in [(0, boundary), (boundary, len(data))]:
+            actual.extend(
+                row.POS for row in vcf_mod.iter_vcf_byte_range(path, start, stop)
+            )
+        assert actual == expected, boundary
+
+
+@pytest.mark.parametrize("workers", [1, 2, 4])
+def test_plain_parallel_dimensions_and_conversion(tmp_path, workers):
+    path = tmp_path / "input.vcf"
+    plain_scan_fixture(path, final_newline=False)
+    expected, header = vcf_mod.scan_vcf_dimensions([path])
+    actual, actual_header = vcf_mod.scan_vcf_dimensions(
+        [path], worker_processes=workers
+    )
+    assert actual.asdict() == expected.asdict()
+    assert actual_header == header
+    serial = vcf_mod.convert([path], infer_shape=True, variants_chunk_size=3)
+    parallel = vcf_mod.convert(
+        [path],
+        infer_shape=True,
+        variants_chunk_size=3,
+        worker_processes=workers,
+    )
+    assert_zarr_equal(serial, parallel)
+
+
+def test_gzip_parallel_scan_warns_and_preserves_results(tmp_path, caplog):
+    plain = tmp_path / "input.vcf"
+    plain_scan_fixture(plain)
+    compressed = tmp_path / "input.vcf.gz"
+    with gzip.open(compressed, "wb") as out:
+        out.write(plain.read_bytes())
+    expected, _ = vcf_mod.scan_vcf_dimensions([compressed])
+    actual, _ = vcf_mod.scan_vcf_dimensions([compressed], worker_processes=2)
+    assert actual.asdict() == expected.asdict()
+    assert "prescan of this file will be serial" in caplog.text
+    assert "indexed BGZF" in caplog.text
+
+
+def test_parallel_scan_preserves_row_budget(tmp_path):
+    path = tmp_path / "input.vcf"
+    plain_scan_fixture(path)
+    with pytest.raises(ValueError, match="exceeds max_batch_bytes"):
+        vcf_mod.scan_vcf_dimensions([path], worker_processes=2, max_batch_bytes=100)
+
+
+def test_empty_plain_parallel_scan(tmp_path):
+    path = tmp_path / "input.vcf"
+    plain_scan_fixture(path)
+    path.write_bytes(
+        b"\n".join(
+            line for line in path.read_bytes().splitlines() if line.startswith(b"#")
+        )
+        + b"\n"
+    )
+    expected, _ = vcf_mod.scan_vcf_dimensions([path])
+    actual, _ = vcf_mod.scan_vcf_dimensions([path], worker_processes=2)
+    assert actual.asdict() == expected.asdict()
+
+
+def test_plain_range_early_close_releases_feeder(tmp_path):
+    path = tmp_path / "input.vcf"
+    plain_scan_fixture(path)
+    with path.open("ab") as out:
+        for i in range(10, 100):
+            out.write(f"1\t{i}\t.\tA\tC\t.\tPASS\tTEXT={'x' * 20000}\tGT\t0\n".encode())
+    iterator = vcf_mod.iter_vcf_byte_range(path, 0, path.stat().st_size)
+    assert next(iterator).POS == 1
+    iterator.close()
+
+
+def test_plain_parallel_scan_rejects_multiple_contigs(tmp_path):
+    path = tmp_path / "input.vcf"
+    plain_scan_fixture(path)
+    text = path.read_text().replace(
+        "##contig=<ID=1>", "##contig=<ID=1>\n##contig=<ID=2>"
+    )
+    path.write_text(text + "2\t1\t.\tA\tC\t.\tPASS\t.\tGT\t0\n")
+    with pytest.raises(ValueError, match="Multi-contig VCFs must be indexed"):
+        vcf_mod.scan_vcf_dimensions([path], worker_processes=2)
+
+
+@pytest.mark.parametrize("max_ploidy", [None, 3])
+def test_plain_parallel_scan_preserves_allele_bound(tmp_path, max_ploidy):
+    path = tmp_path / "input.vcf"
+    plain_scan_fixture(path)
+    expected, _ = vcf_mod.scan_vcf_dimensions(
+        [path], max_ploidy=max_ploidy, max_alleles=2
+    )
+    actual, _ = vcf_mod.scan_vcf_dimensions(
+        [path], worker_processes=2, max_ploidy=max_ploidy, max_alleles=2
+    )
+    assert actual.asdict() == expected.asdict()
+    text = path.read_text().replace("1\t9\t.\tA\tC", "1\t9\t.\tA\tC,G")
+    path.write_text(text)
+    with pytest.raises(ValueError, match="exceeds max_alleles=2"):
+        vcf_mod.scan_vcf_dimensions(
+            [path], worker_processes=2, max_ploidy=max_ploidy, max_alleles=2
+        )
+
+
+@pytest.mark.parametrize(
+    "filename", ["sample.vcf.gz", "sample.bcf", "field_type_combos.vcf.gz"]
+)
+def test_indexed_parallel_scan_preserves_summaries(filename):
+    path = f"tests/data/vcf/{filename}"
+    expected, header = vcf_mod.scan_vcf_dimensions([path])
+    actual, actual_header = vcf_mod.scan_vcf_dimensions([path], worker_processes=2)
+    assert actual == expected
+    assert actual.num_records == expected.num_records
+    assert sum(p.num_records for p in actual.partitions) == expected.num_records
+    assert actual_header == header
 
 
 @pytest.mark.parametrize("bound", [0, -1, True, 1.5])

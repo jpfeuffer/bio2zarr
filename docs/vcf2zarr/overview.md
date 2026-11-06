@@ -124,6 +124,18 @@ with ploidy inferred during the metadata pass. Other variable-width fields
 and numeric dtypes are still discovered: even supplying both maximum bounds
 does **not** make this a single-pass conversion.
 
+With `--worker-processes N`, metadata discovery uses separate processes for
+indexed regions or byte ranges of **local uncompressed VCF** files. Byte-range
+workers seek to complete records and merge their schema bounds; no index or
+temporary copy of the input is needed. Each plain-VCF scan worker has an
+additional bounded pipe-feeder process to supply its header and byte range to
+the native parser. Unindexed gzip VCFs (including BGZF without an index) cannot
+use byte-range prescanning: each such file is scanned serially and a warning is
+logged when workers are requested. Use plain VCF or indexed BGZF for parallel
+prescanning. This changes metadata discovery only; it does not add parallel
+byte-range output encoding.
+The existing requirement to index multi-contig inputs remains unchanged.
+
 `--batch-size` limits rows; `--max-batch-bytes` limits approximate batch payload
 (default 64 MiB per worker, including string contents). Batches also stop at
 output variant-chunk boundaries, so narrow rows normally write each chunk once.
