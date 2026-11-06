@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import IO, Any
+from urllib.parse import urlsplit
 
 import humanfriendly
 import numpy as np
@@ -24,17 +25,18 @@ TABIX_LINEAR_INDEX_INTERVAL_SIZE = 1 << 14  # 16kb interval size
 
 
 def input_path(value):
-    uri = str(value)
-    if uri.startswith(("s3+http://", "s3+https://")):
-        scheme, key = uri.split("://", 1)
+    scheme = storage.protocol(value)
+    if scheme in storage.HTSLIB_S3_PROTOCOLS:
+        uri = urlsplit(str(value))
         endpoint = os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get(
             "AWS_ENDPOINT_URL"
         )
         host = (endpoint or os.environ.get("HTS_S3_HOST", "s3.amazonaws.com")).split(
             "://", 1
         )[-1]
-        result = storage.path(f"s3://{key}")
-        return type(result)(result, endpoint_url=f"{scheme.split('+', 1)[1]}://{host}")
+        result = storage.path(uri._replace(scheme=storage.S3_PROTOCOL).geturl())
+        transport = storage.HTSLIB_S3_PROTOCOLS[scheme]
+        return type(result)(result, endpoint_url=f"{transport}://{host}")
     return storage.path(value)
 
 
