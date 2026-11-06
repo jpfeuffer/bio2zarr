@@ -7,6 +7,7 @@ import uuid
 
 import boto3
 import click.testing
+import numpy.testing as nt
 import pytest
 
 from bio2zarr import bgen, cli, plink, storage, vcz, zarr_utils
@@ -230,6 +231,84 @@ def test_minio_local_bed_remote_output(minio, zarr_format):
     assert_zarr_equal(
         plink.convert(source, **kwargs), plink.convert(source, out, **kwargs)
     )
+
+
+def upload_plink(minio, filename):
+    for suffix in (".bed", ".bim", ".fam"):
+        upload(minio, "plink", filename + suffix)
+    return f"s3://{minio[1]}/input/{filename}"
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+@pytest.mark.parametrize(
+    "filename", ["example", "example_with_fam", "plink_sim_10s_100v_10pmiss"]
+)
+@pytest.mark.parametrize("remote_output", [False, True])
+def test_minio_remote_plink(minio, tmp_path, zarr_format, filename, remote_output):
+    uri = upload_plink(minio, filename)
+    out = f"s3://{minio[1]}/out" if remote_output else tmp_path / "local.vcz"
+    kwargs = dict(
+        zarr_format=zarr_format,
+        variants_chunk_size=3,
+        samples_chunk_size=2,
+        worker_processes=2,
+    )
+    expected = plink.convert(DATA / "plink" / filename, **kwargs)
+    actual = plink.convert(uri, out, **kwargs)
+    assert_zarr_equal(expected, actual)
+    assert_zarr_equal(expected, zarr_utils.open_vcf_zarr(out))
+
+
+def test_minio_bed_range_reads(minio, monkeypatch):
+    uri = upload_plink(minio, "plink_sim_10s_100v_10pmiss")
+    bed = storage.path(uri + ".bed")
+    calls = []
+    call_s3 = bed.fs._call_s3
+
+    async def record(method, *args, **kwargs):
+        if method == "get_object":
+            calls.append(kwargs.get("Range"))
+        return await call_s3(method, *args, **kwargs)
+
+    monkeypatch.setattr(bed.fs, "_call_s3", record)
+    actual = plink.BedReader(bed, 100, 10).decode(90, 93)
+    expected = plink.BedReader(
+        DATA / "plink" / "plink_sim_10s_100v_10pmiss.bed", 100, 10
+    ).decode(90, 93)
+    nt.assert_array_equal(expected, actual)
+    assert calls == ["bytes=0-2", "bytes=273-281"]
+
+
+@pytest.mark.parametrize("suffix", [".bed", ".bim", ".fam"])
+def test_minio_missing_plink_file(minio, suffix):
+    uri = upload_plink(minio, "example")
+    minio[0].delete_object(Bucket=minio[1], Key="input/example" + suffix)
+    with pytest.raises(FileNotFoundError):
+        plink.convert(uri)
+
+
+def test_minio_invalid_and_truncated_bed(minio):
+    uri = upload_plink(minio, "example")
+    key = "input/example.bed"
+    minio[0].put_object(Bucket=minio[1], Key=key, Body=b"invalid")
+    with pytest.raises(ValueError, match="Invalid BED file magic"):
+        plink.convert(uri)
+    minio[0].put_object(Bucket=minio[1], Key=key, Body=b"\x6c\x1b\x01")
+    with pytest.raises(ValueError, match="Truncated BED"):
+        plink.convert(uri)
+
+
+def test_minio_remote_plink_cli(minio):
+    uri = upload_plink(minio, "example")
+    out = f"s3://{minio[1]}/out"
+    result = click.testing.CliRunner().invoke(
+        cli.plink2zarr_main,
+        ["convert", uri, out, "-Q", "--zarr-format", "3"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    expected = plink.convert(DATA / "plink" / "example", zarr_format=3)
+    assert_zarr_equal(expected, zarr_utils.open_vcf_zarr(out))
 
 
 def test_minio_bgen_sidecar_and_samples(minio, tmp_path):
