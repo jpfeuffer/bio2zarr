@@ -707,8 +707,8 @@ vcf2zarr_main.add_command(dencode_finalise)
 
 
 @click.command(name="convert")
-@click.argument("in_path", type=click.Path())
-@click.argument("zarr_path", type=click.Path())
+@click.argument("in_path", type=StoragePath())
+@new_zarr_path
 @force
 @worker_processes
 @progress

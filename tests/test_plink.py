@@ -53,6 +53,13 @@ class TestReadFam:
 
 
 class TestBedReader:
+    def test_truncated_bed(self, tmp_path):
+        path = tmp_path / "truncated.bed"
+        path.write_bytes(b"\x6c\x1b\x01")
+        reader = plink.BedReader(path, 2, 10)
+        with pytest.raises(ValueError, match="Truncated BED file"):
+            reader.decode(0, 2)
+
     @pytest.mark.parametrize(
         "path",
         [

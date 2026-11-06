@@ -10,7 +10,8 @@
 - Add native HTSlib S3 VCF/BCF input with indexes (no presigned URLs),
   S3 ICF read/write (including distributed stages), native BGEN remote input
   and sidecars, and final S3 Zarr output/indexing in formats 2/3. Support
-  automatically cleaned-up temporary ICF and retryable partition completion.
+  PLINK 1 BED/BIM/FAM S3 input using byte-range BED reads and streamed sidecars.
+  Add automatically cleaned-up temporary ICF and retryable partition completion.
   Write remote partitions directly to disjoint final chunk keys, with
   metadata-only completion and no dataset copies.
 - Preserve missing local-allele AD/PL rows when batching VCF conversion.

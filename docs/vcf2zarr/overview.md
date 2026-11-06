@@ -235,15 +235,17 @@ retains its staging-and-rename behavior.
 ### PLINK 1 BED/BIM/FAM
 
 PLINK 1 binary filesets (`.bed`, `.bim`, `.fam`) remain supported by
-`plink2zarr convert`. Their input reader is unchanged and currently requires
-local files; native S3 BED input is not implemented. Local filesets can write
-directly to S3 through the shared Zarr writer:
+`plink2zarr convert`. Local and S3 filesets can write directly to local or S3
+Zarr output. BED input uses seekable UPath/S3 range reads for the assigned
+variant interval, without downloading or caching the entire BED file.
+BIM/FAM text is streamed through UPath into the existing metadata parser.
+Supply the common fileset prefix, not an individual file:
 
 ```bash
-plink2zarr convert /local/fileset s3://my-bucket/output/fileset.vcz
+plink2zarr convert s3://my-bucket/input/fileset s3://my-bucket/output/fileset.vcz
 ```
 
-Local BED-to-S3 conversion is covered by the real MinIO integration suite in
+Local and remote BED conversion is covered by the real MinIO integration suite in
 Zarr formats 2 and 3 with spawned workers, comparing all output arrays,
 attributes, dimensions, compression settings and region indexes against local
 output. Existing PLINK 1 tests also check decoding and compatibility with

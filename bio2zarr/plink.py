@@ -4,7 +4,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from bio2zarr import constants, core, vcz, zarr_utils
+from bio2zarr import constants, core, storage, vcz, zarr_utils
 from bio2zarr.zarr_utils import STRING_DTYPE_NAME
 
 logger = logging.getLogger(__name__)
@@ -38,14 +38,20 @@ BIM_ARRAY_DTYPE = {f[0]: f[2] for f in BIM_FIELDS}
 def read_fam(path):
     # See: https://www.cog-genomics.org/plink/1.9/formats#fam
     names = [f[0] for f in FAM_FIELDS]
-    df = pd.read_csv(path, sep=None, names=names, dtype=FAM_DF_DTYPE, engine="python")
+    with storage.path(path).open("r") as file:
+        df = pd.read_csv(
+            file, sep=None, names=names, dtype=FAM_DF_DTYPE, engine="python"
+        )
     return df
 
 
 def read_bim(path):
     # See: https://www.cog-genomics.org/plink/1.9/formats#bim
     names = [f[0] for f in BIM_FIELDS]
-    df = pd.read_csv(path, sep=None, names=names, dtype=BIM_DF_DTYPE, engine="python")
+    with storage.path(path).open("r") as file:
+        df = pd.read_csv(
+            file, sep=None, names=names, dtype=BIM_DF_DTYPE, engine="python"
+        )
     return df
 
 
@@ -60,13 +66,13 @@ class BedReader:
     def __init__(self, path, num_variants, num_samples):
         self.num_variants = num_variants
         self.num_samples = num_samples
-        self.path = path
+        self.path = storage.path(path)
         # bytes per variant: 1 byte per 4 samples, rounded up
         self.bytes_per_variant = (self.num_samples + 3) // 4
 
         # TODO open this as a persistent file and support reading from a
         # stream
-        with open(self.path, "rb") as f:
+        with self.open() as f:
             magic = f.read(3)
             if magic != b"\x6c\x1b\x01":
                 raise ValueError("Invalid BED file magic bytes")
@@ -96,6 +102,10 @@ class BedReader:
 
         self.byte_lookup = lookup
 
+    def open(self):
+        options = {"cache_type": "none"} if storage.is_remote(self.path) else {}
+        return self.path.open("rb", **options)
+
     def iter_decode(self, start, stop, buffer_size=None):
         """
         Iterate of over the variants in the specified window
@@ -122,9 +132,14 @@ class BedReader:
 
         # TODO make it possible to read sequentially from the same file handle,
         # seeking only when necessary.
-        with open(self.path, "rb") as f:
+        with self.open() as f:
             f.seek(start_offset)
             chunk_data = f.read(bytes_to_read)
+        if len(chunk_data) != bytes_to_read:
+            raise ValueError(
+                f"Truncated BED file {self.path}: expected {bytes_to_read} bytes "
+                f"at offset {start_offset}, found {len(chunk_data)}"
+            )
 
         data_bytes = np.frombuffer(chunk_data, dtype=np.uint8)
         data_matrix = data_bytes.reshape(chunk_size, self.bytes_per_variant)
@@ -319,7 +334,8 @@ def convert(
     ----------
     prefix : str or Path
         Path prefix for the PLINK fileset (i.e. the shared prefix of the
-        .bed, .bim, and .fam files).
+        .bed, .bim, and .fam files). Local paths and s3:// prefixes are supported.
+        S3 BED data is read using byte ranges, not downloaded in full.
     out : str, Path, or None
         Output path for the Zarr store. The output format depends on the value:
 
@@ -328,7 +344,7 @@ def convert(
         - **Ends with .zip**: write to a directory, then package as a zip
           archive readable via :class:`zarr.storage.ZipStore`. The
           intermediate directory is removed.
-        - **Otherwise**: write directly to the given directory path.
+        - **Otherwise**: write directly to the given directory or S3 prefix.
     mode : str
         Mode in which the returned :class:`zarr.Group` is opened.
         Use ``"r"`` (default) for read-only access or ``"r+"`` for
