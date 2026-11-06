@@ -193,11 +193,14 @@ are mutually exclusive, and neither may be used with no-ICF conversion.
 accept S3 ICF prefixes. Final VCZ output, reopening, inspection and
 `create-index` also accept S3 prefixes. ZIP input/output remains local-only.
 
-S3 has no atomic directory rename. Partition retries invalidate their completion
-marker before rewriting; publication copies all objects before writing the
-marker and removing the working prefix. Finalisation requires every marker,
-copies chunks and array metadata while retaining partition sources for retry,
-and removes `wip` only after every array succeeds. Bio2zarr reopening/inspection
+Remote output is written directly to its final chunk keys, with no staging
+copy, partition copy or finalisation copy. Workers own non-overlapping,
+variant-chunk-aligned ranges, so they can write concurrently without sharing
+chunks. Partition retries invalidate their completion marker before rewriting
+their assigned range; the marker is written only after every field succeeds.
+Finalisation requires every marker and creates the region index before
+removing `wip`. Publication is this metadata-only completion step, not a
+directory rename or a copy of the dataset. Bio2zarr reopening/inspection
 rejects remote destinations that still contain `wip`. Do not read a destination
 while conversion/finalisation is running; an interrupted finalisation can be
 retried with `dencode-finalise`. Concurrent writers to the same partition or
@@ -218,13 +221,16 @@ remote. If no metafile exists, the converter builds a temporary **local** index
 from the native remote reader. Sidecars are checked for count and timestamp
 consistency, never overwritten. Native reads use bgen-limix's AWS credential
 support and `AWS_ENDPOINT_URL` for S3-compatible endpoints; for BGEN use
-`s3://` even for HTTP endpoints. Remote output shares the writer above and is
-staged under a unique sibling prefix before publication. On S3 publication is
-a copy, not an atomic rename; a `wip/.publishing` marker blocks Bio2zarr reopening
-until the copy succeeds. Failed publication can be rerun with explicit
-`--force`; do not read while it is being published.
-Malformed data is rejected without publishing a destination, including the
-unsorted tail of the bundled `example.8bits.bgen` fixture.
+`s3://` even for HTTP endpoints. Remote output uses the same direct writer
+above; no full-store staging or copying is performed. Validation failures during
+metadata discovery leave the destination absent, including the unsorted tail
+of the bundled `example.8bits.bgen` fixture. Failures during decoding can leave
+partial chunks under the destination, but `wip` keeps it unreadable through
+Bio2zarr. Rerun the BGEN conversion with explicit `--force` to discard that
+incomplete prefix and start again. Remote CLI overwrite follows the usual
+confirmation/`--force` policy: existing output is removed before encoding,
+so it is not retained if the replacement fails. Local directory/ZIP output
+retains its staging-and-rename behavior.
 
 Local PLINK BED inputs can write to S3 through the shared writer. PGEN conversion
 is not included in this layer. TODO: enable PGEN S3 input when pgenlib delivers

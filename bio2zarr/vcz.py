@@ -582,19 +582,6 @@ def output_path(path):
     return result
 
 
-def publish_zarr(src, dest):
-    """Publish a staged store, marking incomplete remote copies explicitly."""
-    if isinstance(dest, storage.S3Path):
-        marker = dest / "wip" / ".publishing"
-        with marker.open("w") as f:
-            f.write("")
-        storage.copy_tree(src, dest)
-        marker.unlink()
-        storage.remove_tree(src)
-    else:
-        storage.move(src, dest)
-
-
 @contextlib.contextmanager
 def open_zarr(zarr_path, mode="r"):
     """Context manager that resolves zarr_path to a working directory path.
@@ -697,6 +684,8 @@ class VcfZarrWriter:
         self.zarr_format = zarr_format
         self.wip_path = self.path / "wip"
         self.arrays_path = self.wip_path / "arrays"
+        if isinstance(self.path, storage.S3Path):
+            self.arrays_path = self.path
         self.partitions_path = self.wip_path / "partitions"
         self.metadata = None
         self.source = None
@@ -753,6 +742,9 @@ class VcfZarrWriter:
         )
 
         storage.mkdir(self.path)
+        if isinstance(self.path, storage.S3Path):
+            with (self.wip_path / ".incomplete").open("w") as f:
+                f.write("")
         root = zarr_utils.open_zarr_append(self.path, zarr_format=self.zarr_format)
         root.attrs.update(
             {
@@ -905,6 +897,8 @@ class VcfZarrWriter:
         return self.partitions_path / f"wip_p{partition_index}"
 
     def wip_partition_array_path(self, partition_index, name):
+        if isinstance(self.path, storage.S3Path):
+            return self.path / name
         return self.wip_partition_path(partition_index) / name
 
     def partition_array_path(self, partition_index, name):
@@ -920,8 +914,11 @@ class VcfZarrWriter:
             marker = final_path / ".complete"
             if marker.exists():
                 marker.unlink()
-            if partition_path.exists():
-                storage.remove_tree(partition_path)
+            logger.info(f"Encoding partition {partition_index} directly to {self.path}")
+            self.encode_partition_fields(partition_index)
+            with marker.open("w") as f:
+                f.write("")
+            return
         storage.mkdir(partition_path, exist_ok=True)
         logger.info(f"Encoding partition {partition_index} to {partition_path}")
 
@@ -931,13 +928,7 @@ class VcfZarrWriter:
         if final_path.exists():
             logger.warning(f"Removing existing partition at {final_path}")
             storage.remove_tree(final_path)
-        if isinstance(self.path, storage.S3Path):
-            storage.copy_tree(partition_path, final_path)
-            with (final_path / ".complete").open("w") as f:
-                f.write("")
-            storage.remove_tree(partition_path)
-        else:
-            storage.move(partition_path, final_path)
+        storage.move(partition_path, final_path)
 
     def encode_partition_fields(self, partition_index):
         all_field_names = [field.name for field in self.schema.fields]
@@ -958,6 +949,8 @@ class VcfZarrWriter:
             self.encode_local_allele_fields_partition(partition_index)
 
     def open_partition_array(self, partition_index, name):
+        if isinstance(self.path, storage.S3Path):
+            return zarr.open_array(store=storage.zarr_store(self.path / name), mode="a")
         field_map = self.schema.field_map()
         array_spec = field_map[name]
         # Create an empty array like the definition
@@ -1149,7 +1142,12 @@ class VcfZarrWriter:
     def finalise_array(self, name):
         logger.info(f"Finalising {name}")
         final_path = self.path / name
-        if final_path.exists() and not isinstance(self.path, storage.S3Path):
+        if isinstance(self.path, storage.S3Path):
+            if not final_path.exists():
+                raise ValueError(f"Array {name} does not exist")
+            core.update_progress(1)
+            return
+        if final_path.exists():
             # NEEDS TEST
             raise ValueError(f"Array {name} already exists")
         for partition in range(self.num_partitions):
@@ -1163,10 +1161,7 @@ class VcfZarrWriter:
             )
         # Finally, once all the chunks have moved into the arrays dir,
         # we move it out of wip
-        if isinstance(self.path, storage.S3Path):
-            storage.copy_tree(self.arrays_path / name, final_path)
-        else:
-            storage.move(self.arrays_path / name, final_path)
+        storage.move(self.arrays_path / name, final_path)
         core.update_progress(1)
 
     def finalise(self, show_progress=False):
@@ -1204,6 +1199,8 @@ class VcfZarrWriter:
         with core.ParallelWorkManager(0, progress_config) as pwm:
             for field in self.schema.fields:
                 pwm.submit(self.finalise_array, field.name)
+        if isinstance(self.path, storage.S3Path):
+            self.create_index()
         logger.debug(f"Removing {self.wip_path}")
         storage.remove_tree(self.wip_path)
 

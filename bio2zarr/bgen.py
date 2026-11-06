@@ -933,9 +933,13 @@ def convert(
     estimated working buffers within 256 MiB per worker. Output is assembled
     one field/sample-chunk slab at a time; native reads include all samples.
     This is a buffer budget, not a bound on total process RSS or codec scratch.
-    Directory/zip output is staged beside the destination and renamed only
+    Local directory/zip output is staged beside the destination and renamed only
     after validation and encoding succeed; no intermediate genotype copy is
     written. ICF conversion is not currently implemented.
+    S3 output writes disjoint partitions directly to final chunk keys without
+    copying the dataset. An incomplete marker blocks Bio2zarr reopening until
+    every partition and the region index are complete. A failed decode can
+    leave an incomplete remote prefix; explicitly remove it before rerunning.
     Probabilities default to float64 to retain the backend's precision,
     including independently rounded layout-1 values and 32-bit layout-2
     probabilities. Explicit float32 output rounds values without renormalizing.
@@ -987,6 +991,8 @@ def convert(
         out = vcz.output_path(out)
         if out.exists():
             raise ValueError("Zarr path already exists")
+        if isinstance(out, storage.S3Path):
+            return vcz.encode(source, schema, out, **kwargs)
         # Numerical validation occurs during decoding. Publish only a complete
         # store, leaving the requested path absent on malformed input.
         with storage.temporary_path(out.parent, prefix=".bio2zarr-bgen-") as tmp:
@@ -995,7 +1001,7 @@ def convert(
             root.store.close()
             if out.exists():
                 raise ValueError("Zarr path already exists")
-            vcz.publish_zarr(staged, out)
+            storage.move(staged, out)
         store = (
             zarr.storage.ZipStore(out, mode="r")
             if out.suffix == ".zip"
