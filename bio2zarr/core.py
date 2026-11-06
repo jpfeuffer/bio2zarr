@@ -230,7 +230,7 @@ def sync_flush_2d_array(np_buffer, zarr_array, offset):
 
 @dataclasses.dataclass
 class ProgressConfig:
-    total: int = 0
+    total: int | None = 0
     units: str = ""
     title: str = ""
     show: bool = False

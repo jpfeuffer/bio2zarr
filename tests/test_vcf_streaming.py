@@ -8,7 +8,7 @@ import numpy as np
 import numpy.testing as nt
 import pytest
 
-from bio2zarr import cli
+from bio2zarr import cli, core
 from bio2zarr import vcf as vcf_mod
 
 pytestmark = pytest.mark.skipif(
@@ -245,6 +245,82 @@ def test_indexed_parallel_scan_preserves_summaries(filename):
     assert actual.num_records == expected.num_records
     assert sum(p.num_records for p in actual.partitions) == expected.num_records
     assert actual_header == header
+
+
+def test_serial_gzip_prescan_updates_before_completion(tmp_path):
+    plain = tmp_path / "input.vcf"
+    plain_scan_fixture(plain)
+    with plain.open("a") as out:
+        for i in range(10, 2051):
+            out.write(f"1\t{i}\t.\tA\tC\t.\tPASS\t.\tGT\t0\n")
+    compressed = tmp_path / "input.vcf.gz"
+    with gzip.open(compressed, "wb") as out:
+        out.write(plain.read_bytes())
+    updates = []
+    with (
+        mock.patch.object(
+            vcf_mod, "variant_values", wraps=vcf_mod.variant_values
+        ) as values,
+        mock.patch.object(vcf_mod.time, "monotonic", return_value=0),
+        mock.patch.object(
+            core,
+            "update_progress",
+            side_effect=lambda inc: updates.append((values.call_count, inc)),
+        ),
+    ):
+        metadata, _ = vcf_mod.scan_vcf_dimensions([compressed], show_progress=True)
+    assert metadata.num_records == 2050
+    assert updates == [(0, 1), (1024, 1024), (2048, 1024), (2050, 2)]
+
+
+def test_prescan_time_based_progress(tmp_path):
+    path = tmp_path / "input.vcf"
+    plain_scan_fixture(path)
+    metadata, _ = vcf_mod.scan_vcf_dimensions([path])
+    with (
+        mock.patch.object(
+            vcf_mod.time, "monotonic", side_effect=[j * 0.2 for j in range(10)]
+        ),
+        mock.patch.object(core, "update_progress") as update,
+    ):
+        count, _, _ = vcf_mod.scan_dimension_partition(
+            metadata,
+            metadata.partitions[0],
+            None,
+            None,
+            None,
+            vcf_mod.DEFAULT_MAX_BATCH_BYTES,
+            show_progress=True,
+        )
+    assert count == 9
+    assert update.call_args_list == [mock.call(1)] * 9
+
+
+@pytest.mark.parametrize("kind", ["plain", "gzip", "indexed"])
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("show_progress", [False, True])
+def test_prescan_record_progress(tmp_path, capsys, kind, workers, show_progress):
+    path = tmp_path / "input.vcf"
+    plain_scan_fixture(path)
+    if kind == "gzip":
+        compressed = tmp_path / "input.vcf.gz"
+        with gzip.open(compressed, "wb") as out:
+            out.write(path.read_bytes())
+        path = compressed
+    elif kind == "indexed":
+        path = "tests/data/vcf/sample.vcf.gz"
+    with mock.patch.object(core.tqdm, "tqdm", wraps=core.tqdm.tqdm) as progress:
+        metadata, _ = vcf_mod.scan_vcf_dimensions(
+            [path], worker_processes=workers, show_progress=show_progress
+        )
+    config = progress.call_args.kwargs
+    assert config["unit"] == "records"
+    assert config["total"] == (9 if kind == "indexed" else None)
+    assert config["disable"] is not show_progress
+    assert core.get_progress() == (metadata.num_records if show_progress else 0)
+    output = capsys.readouterr()
+    assert ("Dimensions" in output.err) is show_progress
+    assert output.out == ""
 
 
 @pytest.mark.parametrize("bound", [0, -1, True, 1.5])

@@ -13,6 +13,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from functools import partial
 from itertools import islice
 from typing import Any
@@ -1393,13 +1394,21 @@ def iter_vcf_byte_range(path, start, stop):
 
 
 def scan_dimension_partition(
-    metadata, partition, byte_range, max_ploidy, max_alleles, budget
+    metadata,
+    partition,
+    byte_range,
+    max_ploidy,
+    max_alleles,
+    budget,
+    show_progress=False,
 ):
     transformers = {
         f.full_name: VcfValueTransformer.factory(f, metadata.num_samples)
         for f in metadata.fields
     }
     count = 0
+    pending_progress = 0
+    last_progress = time.monotonic() if show_progress else None
     last_position = None
     with contextlib.ExitStack() as stack:
         if byte_range is None:
@@ -1428,6 +1437,15 @@ def scan_dimension_partition(
                     )
             count += 1
             last_position = variant.POS
+            if show_progress:
+                pending_progress += 1
+                now = time.monotonic()
+                if pending_progress >= 1024 or now - last_progress >= 0.1:
+                    core.update_progress(pending_progress)
+                    pending_progress = 0
+                    last_progress = now
+    if pending_progress:
+        core.update_progress(pending_progress)
     return count, last_position, [f.summary for f in metadata.fields]
 
 
@@ -1495,7 +1513,10 @@ def scan_vcf_dimensions(
         partition.num_records = 0
         partition.region.end = None
     progress = core.ProgressConfig(
-        total=len(jobs), units="regions", title="Dimensions", show=show_progress
+        total=int(expected_records) if np.isfinite(expected_records) else None,
+        units="records",
+        title="Dimensions",
+        show=show_progress,
     )
     with core.ParallelWorkManager(worker_processes, progress) as pwm:
         futures = [
@@ -1509,6 +1530,7 @@ def scan_vcf_dimensions(
                     max_ploidy,
                     max_alleles,
                     max_batch_bytes,
+                    show_progress,
                 ),
             )
             for index, partition, byte_range in jobs
@@ -1521,7 +1543,6 @@ def scan_vcf_dimensions(
                 partition.region.end = max(partition.region.end or 0, last_position)
             for field, summary in zip(metadata.fields, summaries):
                 field.summary.update(summary)
-            core.update_progress(1)
     total = sum(p.num_records for p in metadata.partitions)
     if np.isfinite(expected_records) and total != expected_records:
         raise ValueError(

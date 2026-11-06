@@ -136,6 +136,12 @@ prescanning. This changes metadata discovery only; it does not add parallel
 byte-range output encoding.
 The existing requirement to index multi-contig inputs remains unchanged.
 
+When progress is enabled, the dimensions prescan counts records incrementally,
+including serial gzip scans and parallel workers. Indexed inputs provide a
+record total; unindexed inputs show an indeterminate record counter without a
+percentage or ETA. Updates are batched (at most 1024 records or about 0.1 seconds
+of record processing between updates), without an extra counting pass.
+
 `--batch-size` limits rows; `--max-batch-bytes` limits approximate batch payload
 (default 64 MiB per worker, including string contents). Batches also stop at
 output variant-chunk boundaries, so narrow rows normally write each chunk once.
