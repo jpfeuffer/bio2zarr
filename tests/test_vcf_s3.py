@@ -317,6 +317,28 @@ def test_s3_prefix_validation():
         storage.path("gs://bucket/input")
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("local/input.vcf.gz", "file"),
+        (pathlib.Path("local/input.vcf.gz"), "file"),
+        ("s3://bucket/input.vcf.gz", storage.S3_PROTOCOL),
+        (UPath("s3://bucket/input.vcf.gz"), storage.S3_PROTOCOL),
+        ("s3+http://bucket/input.vcf.gz", "s3+http"),
+        ("s3+https://bucket/input.vcf.gz", "s3+https"),
+        ("gs://bucket/input.vcf.gz", "gs"),
+    ],
+)
+def test_storage_protocol(value, expected):
+    assert storage.protocol(value) == expected
+
+
+@pytest.mark.parametrize("scheme", sorted(storage.S3_PROTOCOLS))
+def test_local_only_output_rejects_s3_protocol(scheme):
+    with pytest.raises(click.UsageError, match="must be a local path"):
+        cli.check_overwrite_dir(f"{scheme}://bucket/output", False, allow_s3=False)
+
+
 @pytest.mark.parametrize("scheme", ["s3", "s3+http", "s3+https"])
 def test_universal_pathlib(scheme, monkeypatch):
     monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)

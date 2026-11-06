@@ -26,7 +26,7 @@ class NaturalOrderGroup(click.Group):
 
 class StoragePath(click.Path):
     def convert(self, value, param, ctx):
-        if str(value).startswith(("s3://", "s3+http://", "s3+https://")):
+        if storage.protocol(value) in storage.S3_PROTOCOLS:
             try:
                 vcf_utils.input_path(value)
             except ValueError as e:
@@ -225,7 +225,7 @@ def setup_logging(verbosity):
 
 
 def check_overwrite_dir(path, force, *, allow_s3=True):
-    if str(path).startswith(("s3://", "s3+http://", "s3+https://")) and not allow_s3:
+    if storage.protocol(path) in storage.S3_PROTOCOLS and not allow_s3:
         raise click.UsageError("Final VCZ output must be a local path")
     path = storage.path(path)
     if isinstance(path, storage.S3Path) and path.suffix == ".zip":

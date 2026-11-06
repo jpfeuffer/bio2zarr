@@ -8,12 +8,23 @@ import tempfile
 import uuid
 
 import zarr
+from fsspec.utils import get_protocol
 from upath import UPath
 from upath.implementations.cloud import S3Path
 
+S3_PROTOCOL = "s3"
+HTSLIB_S3_PROTOCOLS = {"s3+http": "http", "s3+https": "https"}
+S3_PROTOCOLS = frozenset({S3_PROTOCOL, *HTSLIB_S3_PROTOCOLS})
+
+
+def protocol(value):
+    """Read a UPath protocol or parse a path using fsspec's public API."""
+    return value.protocol if isinstance(value, UPath) else get_protocol(str(value))
+
 
 def path(value):
-    if isinstance(value, S3Path) or str(value).startswith("s3://"):
+    scheme = protocol(value)
+    if scheme == S3_PROTOCOL:
         result = (
             value
             if isinstance(value, S3Path)
@@ -31,8 +42,8 @@ def path(value):
         ):
             raise ValueError("S3 paths must include a bucket and an object key/prefix")
         return result
-    if "://" in str(value):
-        raise ValueError(f"Unsupported storage protocol: {str(value).split('://')[0]}")
+    if scheme not in ("", "file"):
+        raise ValueError(f"Unsupported storage protocol: {scheme}")
     return pathlib.Path(value)
 
 
