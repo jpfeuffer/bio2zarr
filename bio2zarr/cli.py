@@ -35,6 +35,16 @@ class StoragePath(click.Path):
         return super().convert(value, param, ctx)
 
 
+class ZarrPath(StoragePath):
+    def convert(self, value, param, ctx):
+        value = super().convert(value, param, ctx)
+        try:
+            vcz.output_path(value)
+        except ValueError as e:
+            self.fail(str(e), param, ctx)
+        return value
+
+
 # Common arguments/options
 vcfs = click.argument(
     "vcfs", nargs=-1, required=True, type=StoragePath(exists=True, dir_okay=False)
@@ -48,10 +58,10 @@ icf_path = click.argument(
     "icf_path", type=StoragePath(exists=True, file_okay=False, dir_okay=True)
 )
 
-new_zarr_path = click.argument("zarr_path", type=StoragePath())
+new_zarr_path = click.argument("zarr_path", type=ZarrPath())
 
 zarr_path = click.argument(
-    "zarr_path", type=StoragePath(exists=True, file_okay=False, dir_okay=True)
+    "zarr_path", type=ZarrPath(exists=True, file_okay=False, dir_okay=True)
 )
 
 zarr_format = click.option(
@@ -201,12 +211,8 @@ def setup_logging(verbosity):
     coloredlogs.install(level=level)
 
 
-def check_overwrite_dir(path, force, *, allow_s3=True):
-    if storage.protocol(path) in storage.S3_PROTOCOLS and not allow_s3:
-        raise click.UsageError("Final VCZ output must be a local path")
-    path = storage.path(path)
-    if isinstance(path, storage.S3Path) and path.suffix == ".zip":
-        raise click.UsageError("ZIP output must be a local path")
+def check_overwrite_dir(path, force):
+    path = storage.filesystem_path(path)
     if path.exists():
         if not force:
             click.confirm(
@@ -216,7 +222,7 @@ def check_overwrite_dir(path, force, *, allow_s3=True):
         # These trees can be mondo-big and on slow file systems, so it's entirely
         # feasible that the delete would fail or be killed. This makes it less likely
         # that partially deleted paths are mistaken for good paths.
-        if isinstance(path, storage.S3Path):
+        if storage.is_remote(path):
             storage.remove_tree(path)
             return
         tmp_delete_path = path.with_suffix(f"{path.suffix}.{os.getpid()}.DELETING")
@@ -275,7 +281,7 @@ def explode(
     Convert VCF(s) to intermediate columnar format
     """
     setup_logging(verbose)
-    check_overwrite_dir(icf_path, force, allow_s3=True)
+    check_overwrite_dir(icf_path, force)
     vcf_mod.explode(
         icf_path,
         vcfs,
@@ -314,7 +320,7 @@ def dexplode_init(
     over some number of paritions.
     """
     setup_logging(verbose)
-    check_overwrite_dir(icf_path, force, allow_s3=True)
+    check_overwrite_dir(icf_path, force)
     check_partitions(num_partitions)
     work_summary = vcf_mod.explode_init(
         icf_path,
@@ -936,6 +942,8 @@ def zipzarr(src, dest, unzip, keep, force, verbose, progress):
     it will zip any directory and unzip any archive.
     """
     setup_logging(verbose)
+    if storage.is_remote(src) or (dest is not None and storage.is_remote(dest)):
+        raise click.UsageError("ZIP input/output must be local paths")
     src_path = pathlib.Path(src)
     if unzip:
         if dest is None:
@@ -945,7 +953,7 @@ def zipzarr(src, dest, unzip, keep, force, verbose, progress):
                     "Provide DEST explicitly."
                 )
             dest = str(src_path.with_suffix(""))
-        check_overwrite_dir(dest, force, allow_s3=False)
+        check_overwrite_dir(dest, force)
         logger.info(f"Unzipping {src} -> {dest}")
         zarr_utils.unzip_zarr(src, dest, show_progress=progress)
         if not keep:
