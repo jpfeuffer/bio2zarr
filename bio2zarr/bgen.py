@@ -3,7 +3,6 @@
 import csv
 import logging
 import math
-import os
 import pathlib
 import tempfile
 from collections import Counter
@@ -15,7 +14,7 @@ import numpy as np
 import pandas as pd
 import zarr
 
-from bio2zarr import constants, core, vcz, zarr_utils
+from bio2zarr import constants, core, storage, vcz, zarr_utils
 from bio2zarr.zarr_utils import STRING_DTYPE_NAME
 
 logger = logging.getLogger(__name__)
@@ -29,7 +28,7 @@ def read_sample_file(path, *, sample_id_column=None):
     The first column is the default identifier. Only identifiers are imported;
     other columns are checked for structure and declared types, not trait values.
     """
-    path = pathlib.Path(path)
+    path = storage.path(path)
 
     def error(line, message):
         return ValueError(f"Oxford sample file {path}, line {line}: {message}")
@@ -126,7 +125,7 @@ def validate_dimension_options(dimension_source, probability_model, max_ploidy):
 @contextmanager
 def bgen_limix_metafile(path):
     """Reuse bgen-limix index sidecars; create a temporary index only if absent."""
-    path = pathlib.Path(path)
+    path = storage.path(path)
     candidate = path.with_name(path.name + ".metafile")
     if candidate.exists():
         yield candidate
@@ -224,7 +223,12 @@ class BgenFormat(vcz.Source):
         )
         self.probability_model = probability_model
         self.max_ploidy = max_ploidy
-        self._path = str(pathlib.Path(path).resolve())
+        input_path = storage.path(path)
+        self._path = str(
+            input_path
+            if isinstance(input_path, storage.S3Path)
+            else input_path.resolve()
+        )
         self.metafile_path = str(metafile_path)
         with self.open_reader() as source:
             self.layout = source.layout
@@ -254,7 +258,7 @@ class BgenFormat(vcz.Source):
             if len(set(sample_ids)) != len(sample_ids):
                 raise ValueError("sample_ids must be unique")
             self._samples = [vcz.Sample(id=s) for s in sample_ids]
-            index_path = pathlib.Path(self.metafile_path)
+            index_path = storage.path(self.metafile_path)
             if index_path.exists():
                 self.validate_metafile()
                 logger.info("Reusing bgen-limix metafile %s", index_path)
@@ -267,7 +271,7 @@ class BgenFormat(vcz.Source):
     def validate_metafile(self):
         import cbgen  # noqa: PLC0415
 
-        index_path = pathlib.Path(self.metafile_path)
+        index_path = storage.path(self.metafile_path)
         with cbgen.BgenMetafile(self.metafile_path) as index:
             if index.nvariants != self.num_records:
                 raise ValueError(
@@ -277,7 +281,16 @@ class BgenFormat(vcz.Source):
                 raise ValueError(
                     f"BGEN metafile {index_path} has an invalid partition count"
                 )
-        if index_path.stat().st_mtime_ns < pathlib.Path(self.path).stat().st_mtime_ns:
+        input_path = storage.path(self.path)
+        timestamp = (
+            "st_mtime"
+            if isinstance(index_path, storage.S3Path)
+            or isinstance(input_path, storage.S3Path)
+            else "st_mtime_ns"
+        )
+        index_time = getattr(index_path.stat(), timestamp)
+        input_time = getattr(input_path.stat(), timestamp)
+        if index_time < input_time:
             raise ValueError(
                 f"BGEN metafile {index_path} is older than the input; "
                 "regenerate the bgen-limix index before converting"
@@ -971,19 +984,21 @@ def convert(
         )
         if out is None:
             return vcz.encode(source, schema, **kwargs)
-        out = pathlib.Path(out)
+        out = vcz.output_path(out)
         if out.exists():
             raise ValueError("Zarr path already exists")
         # Numerical validation occurs during decoding. Publish only a complete
         # store, leaving the requested path absent on malformed input.
-        with tempfile.TemporaryDirectory(
-            prefix=".bio2zarr-bgen-", dir=out.parent
-        ) as tmp:
-            staged = pathlib.Path(tmp) / out.name
+        with storage.temporary_path(out.parent, prefix=".bio2zarr-bgen-") as tmp:
+            staged = tmp / out.name
             root = vcz.encode(source, schema, staged, **kwargs)
             root.store.close()
             if out.exists():
                 raise ValueError("Zarr path already exists")
-            os.rename(staged, out)
-        store = zarr.storage.ZipStore(out, mode="r") if out.suffix == ".zip" else out
+            vcz.publish_zarr(staged, out)
+        store = (
+            zarr.storage.ZipStore(out, mode="r")
+            if out.suffix == ".zip"
+            else storage.zarr_store(out)
+        )
         return zarr.open(store, mode=mode)

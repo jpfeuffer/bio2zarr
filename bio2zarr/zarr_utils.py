@@ -10,6 +10,8 @@ import zarr
 from numpy.dtypes import StringDType
 from zarr.codecs.blosc import BloscCodec, BloscShuffle
 
+from bio2zarr import storage
+
 logger = logging.getLogger(__name__)
 
 numcodecs.blosc.use_threads = False
@@ -93,7 +95,7 @@ def open_zarr_append(store, zarr_format):
     """Open a Zarr store for append using the given Zarr format"""
     if zarr_format is None:
         zarr_format = DEFAULT_ZARR_FORMAT
-    return zarr.open(store=store, mode="a", zarr_format=zarr_format)
+    return zarr.open(store=storage.zarr_store(store), mode="a", zarr_format=zarr_format)
 
 
 def open_vcf_zarr(path):
@@ -102,9 +104,13 @@ def open_vcf_zarr(path):
     ``path`` may be a directory store or a ``.zip`` archive. Raises
     ``ValueError`` if the path does not hold a VCF Zarr store.
     """
-    path = pathlib.Path(path)
-    store = path
+    path = storage.path(path)
+    if isinstance(path, storage.S3Path) and (path / "wip").exists():
+        raise ValueError(f"VCF Zarr conversion is incomplete: {path}")
+    store = storage.zarr_store(path)
     if path.suffix == ".zip":
+        if isinstance(path, storage.S3Path):
+            raise ValueError("ZIP input must be a local path")
         store = zarr.storage.ZipStore(path, mode="r")
     try:
         root = zarr.open(store, mode="r")
@@ -232,7 +238,7 @@ def move_chunks(src_path, dest_path, partition, name, zarr_format):
         ]
     else:
         dest = dest_path / name / "c"
-        dest.mkdir(exist_ok=True)
+        storage.mkdir(dest, exist_ok=True)
         src_chunks = src_path / "c"
         if not src_chunks.exists():
             chunk_files = []
@@ -242,7 +248,14 @@ def move_chunks(src_path, dest_path, partition, name, zarr_format):
             ]
     logger.debug(f"Moving {len(chunk_files)} chunks for {name} partition {partition}")
     for chunk_file in chunk_files:
-        os.rename(chunk_file, dest / chunk_file.name)
+        target = dest / chunk_file.name
+        if isinstance(src_path, storage.S3Path):
+            if chunk_file.is_file():
+                chunk_file.fs.cp_file(chunk_file.path, target.path)
+            else:
+                storage.copy_tree(chunk_file, target)
+        else:
+            storage.move(chunk_file, target)
 
 
 def zip_zarr(dir_path, zip_path, *, show_progress=False):

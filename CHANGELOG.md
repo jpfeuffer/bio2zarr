@@ -3,6 +3,7 @@
 *New features*
 
 - Add two-pass VCF conversion without intermediate storage via `--infer-shape`.
+- Add native S3 input, intermediate storage, and Zarr output with retryable publication.
 
 - Add `bgen2zarr convert` and `bio2zarr.bgen.convert` using the `bgen-limix`
   optional backend, preserving genotype/haplotype probabilities and metadata
