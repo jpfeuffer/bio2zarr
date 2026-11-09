@@ -108,6 +108,40 @@ class TestWithGtHeaderNoGenotypes:
 class TestIcfWriterExample:
     data_path = "tests/data/vcf/sample.vcf.gz"
 
+    @pytest.mark.parametrize("dtype", ["i4", "i8", "u4", "u8", "bool"])
+    def test_integer_summary_reduction_equivalence(self, dtype):
+        field = vcf_mod.fixed_vcf_field_definitions()[0]
+        field.summary = vcf_mod.VcfFieldSummary()
+        transformer = vcf_mod.IntegerValueTransformer(field, 0)
+        expected = vcf_mod.VcfFieldSummary()
+        values = [[], [0], [1], [1, 0], [0, 1]]
+        if np.dtype(dtype).kind == "i":
+            values += [
+                [-2147483648],
+                [-2147483647],
+                [-2147483646],
+                [-2],
+                [-1],
+                [-128],
+                [127],
+                [128],
+                [255],
+                [256],
+                [-2147483648, -2147483647],
+                [-128, 256, -2147483648],
+            ]
+        elif np.dtype(dtype).kind == "u":
+            values += [[127], [128], [255], [256], [np.iinfo(dtype).max]]
+        for data in values:
+            array = np.array(data, dtype=dtype)
+            present = array[array >= vcf_mod.constants.MIN_INT_VALUE]
+            if present.size:
+                expected.max_value = int(max(expected.max_value, np.max(present)))
+                expected.min_value = int(min(expected.min_value, np.min(present)))
+            expected.max_number = max(expected.max_number, array.shape[-1])
+            transformer.update_bounds(array)
+            assert field.summary == expected
+
     # fmt: off
     fields = (
         'ALT', 'CHROM', 'FILTERS', 'FORMAT/DP', 'FORMAT/GQ',

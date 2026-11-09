@@ -291,6 +291,45 @@ class TestSmallExample:
         assert dtype_lookup.call_count == integer_fields * len(metadata.partitions)
 
     @pytest.mark.parametrize(
+        "array",
+        [
+            np.array([], dtype="i4"),
+            np.array([], dtype="u8"),
+            np.array([0, 256], dtype="u4"),
+            np.array([True]),
+            np.array([127], dtype="i4"),
+            np.array([128], dtype="i4"),
+            np.array([255], dtype="u4"),
+            np.array([256], dtype="u4"),
+            np.array([-129], dtype="i4"),
+            np.array([-128], dtype="i4"),
+            np.array([-2147483648], dtype="i4"),
+            np.array([-2147483647], dtype="i4"),
+            np.array([-2147483646], dtype="i4"),
+            np.array([np.iinfo("u8").max], dtype="u8"),
+        ],
+    )
+    def test_integer_validation_reduction_equivalence(self, array):
+        metadata, header = vcf_mod.discover_vcf_shape([self.data_path])
+        source = vcf_mod.DirectVcfSource(metadata, header, self.data_path)
+        validation = vcf_mod.DirectVcfValidation(
+            allele_count=2,
+            ploidy=None,
+            local_allele_max=None,
+            fields=(
+                vcf_mod.DirectVcfFieldValidation("INFO/IV", False, 2, (-128, 127)),
+            ),
+        )
+        present = array[array >= vcf_mod.constants.MIN_INT_VALUE]
+        outside = np.any(present < -128) or np.any(present > 127)
+        row = {"ALT": np.array(["C"]), "INFO/IV": array}
+        if outside:
+            with pytest.raises(ValueError, match="exceeds discovered integer dtype"):
+                source.validate_row(row, validation)
+        else:
+            source.validate_row(row, validation)
+
+    @pytest.mark.parametrize(
         ("batch_rows", "buffer_rows"), [(1, 3), (3, 3), (6, 3), (4, 2)]
     )
     def test_batch_buffer_controls(self, tmp_path, batch_rows, buffer_rows):

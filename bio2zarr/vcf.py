@@ -575,10 +575,16 @@ class IntegerValueTransformer(VcfValueTransformer):
         summary = self.field.summary
         # Mask out missing and fill values
         # print(value)
-        a = value[value >= constants.MIN_INT_VALUE]
-        if a.size > 0:
-            summary.max_value = int(max(summary.max_value, np.max(a)))
-            summary.min_value = int(min(summary.min_value, np.min(a)))
+        if value.size == 1:
+            scalar = value.item()
+            if scalar >= constants.MIN_INT_VALUE:
+                summary.max_value = int(max(summary.max_value, scalar))
+                summary.min_value = int(min(summary.min_value, scalar))
+        else:
+            a = value[value >= constants.MIN_INT_VALUE]
+            if a.size > 0:
+                summary.max_value = int(max(summary.max_value, a.max()))
+                summary.min_value = int(min(summary.min_value, a.min()))
         number = value.shape[-1]
         summary.max_number = max(summary.max_number, number)
 
@@ -1728,11 +1734,17 @@ class DirectVcfSource(VcfSource):
                 raise ValueError(f"{name} exceeds discovered field width")
             if field.integer_limits is not None:
                 minimum, maximum = field.integer_limits
-                present = value[value >= constants.MIN_INT_VALUE]
-                if (
-                    present.min(initial=minimum) < minimum
-                    or present.max(initial=maximum) > maximum
-                ):
+                if value.size == 1:
+                    scalar = value.item()
+                    outside = scalar >= constants.MIN_INT_VALUE and not (
+                        minimum <= scalar <= maximum
+                    )
+                else:
+                    present = value[value >= constants.MIN_INT_VALUE]
+                    outside = present.size > 0 and (
+                        present.min() < minimum or present.max() > maximum
+                    )
+                if outside:
                     raise ValueError(f"{name} exceeds discovered integer dtype")
 
 
