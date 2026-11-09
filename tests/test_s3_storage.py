@@ -34,6 +34,15 @@ def minio(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     copy_tree, move = storage.copy_tree, storage.move
 
+    call_s3 = storage.path(f"s3://{bucket}/out").fs._call_s3
+
+    async def without_copy(method, *args, **kwargs):
+        if method in ("copy_object", "upload_part_copy"):
+            pytest.fail("Remote conversion must not copy objects")
+        return await call_s3(method, *args, **kwargs)
+
+    monkeypatch.setattr(storage.path(f"s3://{bucket}/out").fs, "_call_s3", without_copy)
+
     def local_only(operation):
         def checked(src, dest):
             if storage.is_remote(src) or storage.is_remote(dest):
@@ -160,6 +169,44 @@ def test_minio_distributed_retry(minio, tmp_path, monkeypatch, zarr_format):
     assert_zarr_equal(expected, zarr_utils.open_vcf_zarr(out))
     assert neighbour.read_bytes() == b"keep"
     assert not storage.path(out + "/wip").exists()
+
+
+class TestMinioPartitionRetry:
+    @pytest.mark.parametrize("zarr_format", [2, 3])
+    def test_failed_retry_invalidates_completed_partition(
+        self, minio, monkeypatch, zarr_format
+    ):
+        uri = upload(minio, "vcf", "sample.vcf.gz").replace("s3://", "s3+http://")
+        icf = f"s3://{minio[1]}/icf"
+        out = f"s3://{minio[1]}/out"
+        vcf_mod.explode(icf, [uri])
+        summary = vcf_mod.encode_init(
+            icf, out, 3, variants_chunk_size=3, zarr_format=zarr_format
+        )
+        for partition in range(summary.num_partitions):
+            vcf_mod.encode_partition(out, partition)
+        marker = storage.path(out + "/wip/partitions/p0/.complete")
+        assert marker.exists()
+        encode = vcz.VcfZarrWriter.encode_partition_fields
+
+        def fail_retry(writer, partition):
+            encode(writer, partition)
+            raise OSError("injected retry failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(vcz.VcfZarrWriter, "encode_partition_fields", fail_retry)
+            with pytest.raises(OSError, match="injected retry failure"):
+                vcf_mod.encode_partition(out, 0)
+        assert not marker.exists()
+        with pytest.raises(FileNotFoundError, match="Partitions not encoded"):
+            vcf_mod.encode_finalise(out)
+        with pytest.raises(ValueError, match="conversion is incomplete"):
+            zarr_utils.open_vcf_zarr(out)
+        vcf_mod.encode_partition(out, 0)
+        assert marker.exists()
+        vcf_mod.encode_finalise(out)
+        expected = vcf_mod.encode(icf, variants_chunk_size=3, zarr_format=zarr_format)
+        assert_zarr_equal(expected, zarr_utils.open_vcf_zarr(out))
 
 
 @pytest.mark.parametrize("zarr_format", [2, 3])
