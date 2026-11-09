@@ -527,6 +527,23 @@ class VcfValueTransformer:
         if field.category == "FORMAT":
             self.dimension = 2
         self.missing = missing_value_map[field.vcf_type]
+        self.has_string_payload = field.vcf_type in ("String", "Character")
+
+    def native_nbytes(self, value):
+        size = sys.getsizeof(value)
+        if isinstance(value, np.ndarray):
+            if self.has_string_payload:
+                size += sum(map(sys.getsizeof, value.flat))
+        elif isinstance(value, (list, tuple)):
+            # cyvcf2 native field sequences are flat scalars, not nested rows.
+            size += sum(map(sys.getsizeof, value))
+        return size
+
+    def transformed_nbytes(self, value):
+        size = sys.getsizeof(value)
+        if value is not None and self.has_string_payload:
+            size += sum(map(sys.getsizeof, value.flat))
+        return size
 
     @staticmethod
     def factory(field, num_samples):
@@ -1474,14 +1491,19 @@ def summarise_vcf_variants(variants, metadata, ploidy):
     last_position = None
     for variant in variants:
         values = variant_values(variant, metadata, genotypes=ploidy is None)
-        row_bytes = sum(value_nbytes(value) for value in values.values())
+        row_bytes = sum(
+            transformers[name].native_nbytes(value) for name, value in values.items()
+        )
         if 3 * row_bytes > DIRECT_VCF_MEMORY_BUDGET // 2:
             raise ValueError(
                 "VCF row exceeds the no-ICF memory budget; use ICF conversion"
             )
         for name, value in values.items():
             transformed = transformers[name].transform_and_update_bounds(value)
-            if 3 * value_nbytes(transformed) > DIRECT_VCF_MEMORY_BUDGET // 2:
+            if (
+                3 * transformers[name].transformed_nbytes(transformed)
+                > DIRECT_VCF_MEMORY_BUDGET // 2
+            ):
                 raise ValueError(
                     "VCF field exceeds the no-ICF memory budget; use ICF conversion"
                 )
@@ -1621,13 +1643,27 @@ class DirectVcfSource(VcfSource):
         with vcf_utils.VcfFile(partition.vcf_path) as file:
             for variant in file.variants(partition.region):
                 values = variant_values(variant, self.metadata)
-                if 3 * sum(value_nbytes(v) for v in values.values()) > memory_budget:
+                if (
+                    3
+                    * sum(
+                        transformers[name].native_nbytes(value)
+                        for name, value in values.items()
+                    )
+                    > memory_budget
+                ):
                     raise ValueError("VCF row exceeds the no-ICF memory budget")
                 row = {
                     name: None if value is None else transformers[name].transform(value)
                     for name, value in values.items()
                 }
-                if 3 * sum(value_nbytes(v) for v in row.values()) > memory_budget:
+                if (
+                    3
+                    * sum(
+                        transformers[name].transformed_nbytes(value)
+                        for name, value in row.items()
+                    )
+                    > memory_budget
+                ):
                     raise ValueError("VCF row exceeds the no-ICF memory budget")
                 self.validate_row(row, validation)
                 count += 1
@@ -1674,10 +1710,13 @@ class DirectVcfSource(VcfSource):
                     f"Genotype ploidy {gt.shape[1] - 1} exceeds ploidy {ploidy}"
                 )
             alleles = gt[:, :-1]
-            if np.any(alleles >= len(row["ALT"]) + 1) or np.any(alleles < -2):
+            allele_min = alleles.min(initial=-2)
+            allele_max = alleles.max(initial=-2)
+            if allele_max >= len(row["ALT"]) + 1 or allele_min < -2:
                 raise ValueError("Genotype allele index is outside REF+ALT")
-            if validation.local_allele_max is not None and np.any(
-                alleles > validation.local_allele_max
+            if (
+                validation.local_allele_max is not None
+                and allele_max > validation.local_allele_max
             ):
                 raise ValueError("Genotype allele index exceeds local allele dtype")
         for field in validation.fields:
@@ -1690,7 +1729,10 @@ class DirectVcfSource(VcfSource):
             if field.integer_limits is not None:
                 minimum, maximum = field.integer_limits
                 present = value[value >= constants.MIN_INT_VALUE]
-                if np.any(present < minimum) or np.any(present > maximum):
+                if (
+                    present.min(initial=minimum) < minimum
+                    or present.max(initial=maximum) > maximum
+                ):
                     raise ValueError(f"{name} exceeds discovered integer dtype")
 
 

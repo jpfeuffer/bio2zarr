@@ -166,6 +166,35 @@ class TestSmallExample:
             root = vcf_mod.convert([self.data_path], infer_shape=True)
         assert root["variant_position"].shape == (9,)
 
+    @pytest.mark.parametrize(
+        "filename", ["sample.vcf.gz", "field_type_combos.vcf.gz", "mixed_ploidy.vcf.gz"]
+    )
+    def test_schema_aware_memory_charges(self, filename):
+        path = f"tests/data/vcf/{filename}"
+        metadata, _ = vcf_mod.discover_vcf_shape([path])
+        transformers = {
+            field.full_name: vcf_mod.VcfValueTransformer.factory(
+                field, metadata.num_samples
+            )
+            for field in metadata.fields
+        }
+        with vcf_mod.vcf_utils.VcfFile(path) as file:
+            for variant in file.vcf:
+                for name, value in vcf_mod.variant_values(variant, metadata).items():
+                    transformer = transformers[name]
+                    assert transformer.native_nbytes(value) == vcf_mod.value_nbytes(
+                        value
+                    )
+                    transformed = (
+                        None if value is None else transformer.transform(value)
+                    )
+                    assert transformer.transformed_nbytes(
+                        transformed
+                    ) == vcf_mod.value_nbytes(transformed)
+        for transformer in transformers.values():
+            assert transformer.native_nbytes(None) == vcf_mod.value_nbytes(None)
+            assert transformer.transformed_nbytes(None) == vcf_mod.value_nbytes(None)
+
     def test_infer_shape_rejects_icf_path(self, tmp_path):
         with pytest.raises(ValueError, match="cannot specify icf_path"):
             vcf_mod.convert(
@@ -178,6 +207,19 @@ class TestSmallExample:
             pytest.raises(ValueError, match="memory budget"),
         ):
             vcf_mod.convert([self.data_path], infer_shape=True)
+
+    def test_oversized_string_row(self, tmp_path):
+        path = tmp_path / "oversized-id.vcf"
+        path.write_text(
+            "##fileformat=VCFv4.3\n##contig=<ID=1>\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+            f"1\t1\t{'x' * 100_000}\tA\tC\t.\t.\t.\n"
+        )
+        with (
+            mock.patch.object(vcf_mod, "DIRECT_VCF_MEMORY_BUDGET", 128 * 1024),
+            pytest.raises(ValueError, match="VCF row exceeds.*memory budget"),
+        ):
+            vcf_mod.convert([path], infer_shape=True)
 
     def test_byte_bounded_admission(self):
         budget = 1024 * 1024
@@ -359,6 +401,37 @@ class TestSmallExample:
         nt.assert_array_equal(
             actual["call_PL"][:], np.tile([0, 1, 2], (4096, samples, 1))
         )
+
+    @pytest.mark.parametrize("zarr_format", [2, 3])
+    def test_late_ploidy_with_duplicate_positions(self, tmp_path, zarr_format):
+        path = tmp_path / "duplicate-positions.vcf"
+        path.write_text(
+            "##fileformat=VCFv4.3\n##contig=<ID=1>\n"
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts\n"
+            + "".join(
+                f"1\t1\tv{row}\tA\tC\t.\t.\t.\tGT\t"
+                + ("0/1/1" if row == 64 else "0/1")
+                + "\n"
+                for row in range(65)
+            )
+        )
+        icf = vcf_mod.explode(tmp_path / "icf", [path])
+        options = dict(variants_chunk_size=8, zarr_format=zarr_format)
+        expected = vcf_mod.encode(icf.path, **options)
+        with mock.patch.object(vcz.VcfZarrWriter, "batch_rows", 5):
+            actual = vcf_mod.convert(
+                [path], infer_shape=True, worker_processes=4, **options
+            )
+        assert actual["call_genotype"].shape == (65, 1, 3)
+        assert_zarr_equal(expected, actual)
+
+    def test_requested_batch_budget_is_not_silently_capped(self):
+        with (
+            mock.patch.object(vcz.VcfZarrWriter, "batch_rows", 10**9),
+            pytest.raises(ValueError, match="Requested batch or buffer"),
+        ):
+            vcf_mod.convert([self.data_path], infer_shape=True)
 
     @pytest.mark.parametrize("value", ["1,200", "1,2,3"])
     def test_changed_input_overflow(self, tmp_path, value):
