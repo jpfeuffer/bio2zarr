@@ -100,12 +100,16 @@ Use `--infer-shape` when intermediate storage is unavailable:
 ```bash
 vcf2zarr convert sample.vcf.gz sample.vcz --infer-shape
 vcf2zarr convert sample.vcf.gz sample.vcz --infer-shape --ploidy 2
+vcf2zarr convert sample.vcf.gz sample.vcz --infer-shape --max-alleles 4
 ```
 
 This reads the input twice: first to discover dimensions and dtypes, then to
 write Zarr without storing ICF columns. Input files must remain unchanged
 between passes. `--ploidy` pads genotypes to the supplied size, skips genotype
-discovery, and rejects genotypes exceeding that size.
+discovery, and rejects genotypes exceeding that size. `--max-alleles` sets the
+maximum number of alleles including REF (at least 2), sizes allele-dependent
+dimensions, and rejects records exceeding the bound. It requires the explicit
+`--infer-shape` option.
 
 Discovery and encoding use `--worker-processes`, but reading the second pass
 is sequential. Unindexed files are scanned serially per file. For large indexed

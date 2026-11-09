@@ -71,6 +71,7 @@ DEFAULT_CONVERT_ARGS = dict(
     worker_processes=core.DEFAULT_WORKER_PROCESSES,
     local_alleles=False,
     ploidy=None,
+    max_alleles=None,
     zarr_format=None,
     infer_shape=False,
 )
@@ -661,6 +662,71 @@ class TestWithMocks:
         assert result.exit_code == 0
         args = dict(DEFAULT_CONVERT_ARGS, infer_shape=True, ploidy=2)
         mocked.assert_called_once_with((self.vcf_path,), "zarr_path", **args)
+
+    @mock.patch("bio2zarr.vcf.convert")
+    def test_convert_max_alleles(self, mocked):
+        runner = ct.CliRunner()
+        result = runner.invoke(
+            cli.vcf2zarr_main,
+            [
+                "convert",
+                self.vcf_path,
+                "zarr_path",
+                "--infer-shape",
+                "--max-alleles",
+                "4",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        args = dict(DEFAULT_CONVERT_ARGS, infer_shape=True, max_alleles=4)
+        mocked.assert_called_once_with((self.vcf_path,), "zarr_path", **args)
+
+    @pytest.mark.parametrize("max_alleles", ["0", "1"])
+    def test_convert_invalid_max_alleles(self, max_alleles):
+        runner = ct.CliRunner()
+        result = runner.invoke(
+            cli.vcf2zarr_main,
+            [
+                "convert",
+                self.vcf_path,
+                "zarr_path",
+                "--infer-shape",
+                "--max-alleles",
+                max_alleles,
+            ],
+        )
+        assert result.exit_code == 2
+        assert "Invalid value for '--max-alleles'" in result.stderr
+
+    def test_convert_max_alleles_requires_infer_shape_before_overwrite(self, tmp_path):
+        zarr_path = tmp_path / "existing-zarr"
+        zarr_path.mkdir()
+        (zarr_path / "preserve.txt").write_text("keep")
+        runner = ct.CliRunner()
+        result = runner.invoke(
+            cli.vcf2zarr_main,
+            [
+                "convert",
+                self.vcf_path,
+                str(zarr_path),
+                "--max-alleles",
+                "4",
+                "--force",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "--max-alleles requires --infer-shape" in result.stderr
+        assert (zarr_path / "preserve.txt").read_text() == "keep"
+
+    def test_convert_help_documents_max_alleles(self):
+        runner = ct.CliRunner()
+        result = runner.invoke(
+            cli.vcf2zarr_main, ["convert", "--help"], catch_exceptions=False
+        )
+        assert result.exit_code == 0
+        assert "--max-alleles INTEGER" in result.stdout
+        assert "requires --infer-shape" in result.stdout
 
     @pytest.mark.parametrize("response", ["n", "N", "No"])
     @mock.patch("bio2zarr.vcf.convert")

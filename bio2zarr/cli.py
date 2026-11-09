@@ -179,6 +179,15 @@ ploidy = click.option(
     ),
 )
 
+max_alleles = click.option(
+    "--max-alleles",
+    type=click.IntRange(min=2),
+    default=None,
+    help=(
+        "Maximum number of alleles including REF (at least 2); requires --infer-shape."
+    ),
+)
+
 
 def setup_logging(verbosity):
     level = "WARNING"
@@ -523,6 +532,7 @@ def dencode_finalise(zarr_path, verbose, progress):
 @worker_processes
 @local_alleles
 @ploidy
+@max_alleles
 @zarr_format
 @click.option(
     "--infer-shape",
@@ -540,12 +550,15 @@ def convert_vcf(
     worker_processes,
     local_alleles,
     ploidy,
+    max_alleles,
     zarr_format,
     infer_shape,
 ):
     """
     Convert input VCF(s) to VCF Zarr.
     """
+    if max_alleles is not None and not infer_shape:
+        raise click.UsageError("--max-alleles requires --infer-shape")
     setup_logging(verbose)
     check_overwrite_dir(zarr_path, force)
     vcf_mod.convert(
@@ -557,6 +570,7 @@ def convert_vcf(
         worker_processes=worker_processes,
         local_alleles=local_alleles,
         ploidy=ploidy,
+        max_alleles=max_alleles,
         zarr_format=zarr_format,
         infer_shape=infer_shape,
     )
