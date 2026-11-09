@@ -174,6 +174,71 @@ class TestSmallExample:
             root = vcf_mod.convert([self.data_path], infer_shape=True)
         assert root["variant_position"].shape == (9,)
 
+    @pytest.mark.parametrize("zarr_format", [2, 3])
+    def test_max_alleles_sizes_number_fields(self, tmp_path, zarr_format):
+        path = tmp_path / "allele-bounds.vcf"
+        path.write_text(
+            "##fileformat=VCFv4.3\n"
+            "##contig=<ID=1>\n"
+            '##INFO=<ID=IA,Number=A,Type=Integer,Description="Alternate values">\n'
+            '##INFO=<ID=IR,Number=R,Type=Integer,Description="Allele values">\n'
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+            '##FORMAT=<ID=FG,Number=G,Type=Integer,Description="Genotype values">\n'
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n"
+            "1\t1\t.\tA\tC\t.\t.\tIA=5;IR=1,2\tGT:FG\t0/1:10,20,30\n"
+            "1\t2\t.\tA\tC,G\t.\t.\tIA=6,7;IR=3,4,5\tGT:FG\t1/2:10,20,30,40,50,60\n"
+        )
+
+        root = vcf_mod.convert(
+            [path], infer_shape=True, max_alleles=4, zarr_format=zarr_format
+        )
+
+        assert root["variant_allele"].shape == (2, 4)
+        assert root["variant_IA"].shape == (2, 3)
+        assert root["variant_IR"].shape == (2, 4)
+        assert root["call_FG"].shape == (2, 1, 10)
+        nt.assert_array_equal(root["variant_IA"][:1, :1], [[5]])
+        nt.assert_array_equal(root["variant_IR"][:1, :2], [[1, 2]])
+        nt.assert_array_equal(root["call_FG"][1, 0, :6], [10, 20, 30, 40, 50, 60])
+
+    def test_max_alleles_preserves_no_gt_number_g_width(self, tmp_path):
+        path = tmp_path / "no-gt-number-g.vcf"
+        path.write_text(
+            "##fileformat=VCFv4.3\n"
+            "##contig=<ID=1>\n"
+            '##INFO=<ID=IG,Number=G,Type=Float,Description="Genotype values">\n'
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+            "1\t1\t.\tA\tC\t.\tPASS\tIG=1.5,.,3.5,4.5\n"
+        )
+
+        root = vcf_mod.convert([path], infer_shape=True, max_alleles=4)
+
+        assert root["variant_IG"].shape == (1, 4)
+
+    @pytest.mark.parametrize("max_alleles", [0, 1, True, 2.5])
+    def test_invalid_max_alleles(self, max_alleles):
+        with pytest.raises(ValueError, match="max_alleles must be an integer"):
+            vcf_mod.convert([self.data_path], infer_shape=True, max_alleles=max_alleles)
+
+    def test_max_alleles_requires_explicit_infer_shape(self):
+        with pytest.raises(ValueError, match="max_alleles requires infer_shape=True"):
+            vcf_mod.convert([self.data_path], infer_shape=False, max_alleles=4)
+
+    def test_max_alleles_rejects_late_maximum(self, tmp_path):
+        path = tmp_path / "late-maximum.vcf"
+        path.write_text(
+            "##fileformat=VCFv4.3\n"
+            "##contig=<ID=1>\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+            "1\t1\t.\tA\tC\t.\t.\t.\n"
+            "1\t2\t.\tA\tC,G\t.\t.\t.\n"
+        )
+
+        with pytest.raises(
+            ValueError, match=r"Allele count 3 at 1:2 exceeds max_alleles=2"
+        ):
+            vcf_mod.convert([path], infer_shape=True, max_alleles=2)
+
     def test_infer_shape_rejects_icf_path(self, tmp_path):
         with pytest.raises(ValueError, match="cannot specify icf_path"):
             vcf_mod.convert(
@@ -276,6 +341,23 @@ class TestSmallExample:
         )
         root = vcf_mod.convert([path], infer_shape=True, ploidy=2)
         assert root["call_genotype"].dtype == np.dtype("i1" if alleles <= 127 else "i2")
+        nt.assert_array_equal(root["call_genotype"][:], [[[0, alleles]]])
+
+    def test_max_alleles_preserves_genotype_integer_dtype(self, tmp_path):
+        alleles = 256
+        path = tmp_path / "wide-bounded.vcf"
+        path.write_text(
+            "##fileformat=VCFv4.3\n##contig=<ID=1>\n"
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts\n"
+            f"1\t1\t.\tA\t{','.join(['C'] * alleles)}\t.\t.\t.\tGT\t0/{alleles}\n"
+        )
+
+        root = vcf_mod.convert(
+            [path], infer_shape=True, max_alleles=alleles + 1, ploidy=2
+        )
+
+        assert root["call_genotype"].dtype == np.dtype("i2")
         nt.assert_array_equal(root["call_genotype"][:], [[[0, alleles]]])
 
     @pytest.mark.parametrize("genotype", ["0/2", "0/128", "0/0/1"])

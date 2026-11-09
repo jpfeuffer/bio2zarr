@@ -130,6 +130,15 @@ ICF_DEFAULT_COMPRESSOR = numcodecs.Blosc(
 DIRECT_VCF_MEMORY_BUDGET = 256 * 1024**2
 
 
+def validate_max_alleles(max_alleles):
+    if (
+        isinstance(max_alleles, bool)
+        or not isinstance(max_alleles, int)
+        or max_alleles < 2
+    ):
+        raise ValueError("max_alleles must be an integer of at least 2")
+
+
 @dataclasses.dataclass
 class IcfMetadata(core.JsonDataclass):
     samples: list
@@ -1071,12 +1080,23 @@ class VcfSource(vcz.Source):
         samples_chunk_size=None,
         local_alleles=None,
         ploidy=None,
+        max_alleles=None,
     ):
         if local_alleles is None:
             local_alleles = False
 
         name_map = {field.full_name: field for field in self.metadata.fields}
-        max_alleles = max(name_map["ALT"].summary.max_number + 1, 2)
+        observed_alleles = max(name_map["ALT"].summary.max_number + 1, 2)
+        allele_bound_provided = max_alleles is not None
+        if max_alleles is None:
+            max_alleles = observed_alleles
+        else:
+            validate_max_alleles(max_alleles)
+            if observed_alleles > max_alleles:
+                raise ValueError(
+                    f"Allele count {observed_alleles} exceeds "
+                    f"max_alleles={max_alleles} (including REF)"
+                )
 
         # Add ploidy and genotypes dimensions only when needed
         max_genotypes = 0
@@ -1100,6 +1120,8 @@ class VcfSource(vcz.Source):
             # NOTE: it's not clear why we're computing this, when we must have had
             # at least one number=G field to require it anyway?
             genotypes_size = math.comb(max_alleles + ploidy - 1, ploidy)
+            if allele_bound_provided:
+                genotypes_size = max(genotypes_size, max_genotypes)
             # assert max_genotypes == genotypes_size
         else:
             if max_genotypes > 0 or has_g_field:
@@ -1322,7 +1344,7 @@ def value_nbytes(value):
     return size
 
 
-def summarise_vcf_variants(variants, metadata, ploidy):
+def summarise_vcf_variants(variants, metadata, ploidy, max_alleles):
     """Reduce one owned input region without retaining its rows."""
     fields = [
         dataclasses.replace(field, summary=VcfFieldSummary())
@@ -1335,6 +1357,12 @@ def summarise_vcf_variants(variants, metadata, ploidy):
     count = 0
     last_position = None
     for variant in variants:
+        if max_alleles is not None and len(variant.ALT) + 1 > max_alleles:
+            raise ValueError(
+                f"Allele count {len(variant.ALT) + 1} at "
+                f"{variant.CHROM}:{variant.POS} exceeds "
+                f"max_alleles={max_alleles} (including REF)"
+            )
         values = variant_values(variant, metadata, genotypes=ploidy is None)
         row_bytes = sum(value_nbytes(value) for value in values.values())
         if 3 * row_bytes > DIRECT_VCF_MEMORY_BUDGET // 2:
@@ -1357,15 +1385,24 @@ def summarise_vcf_variants(variants, metadata, ploidy):
     )
 
 
-def discover_vcf_partition(metadata, partition_index, ploidy):
+def discover_vcf_partition(metadata, partition_index, ploidy, max_alleles):
     partition = metadata.partitions[partition_index]
     with vcf_utils.VcfFile(partition.vcf_path) as file:
         return partition_index, summarise_vcf_variants(
-            file.variants(partition.region), metadata, ploidy
+            file.variants(partition.region), metadata, ploidy, max_alleles
         )
 
 
-def discover_vcf_shape(vcfs, *, ploidy=None, worker_processes=0, show_progress=False):
+def discover_vcf_shape(
+    vcfs,
+    *,
+    ploidy=None,
+    max_alleles=None,
+    worker_processes=0,
+    show_progress=False,
+):
+    if max_alleles is not None:
+        validate_max_alleles(max_alleles)
     metadata, header = scan_vcfs(
         vcfs, show_progress, max(1, worker_processes * 4), worker_processes
     )
@@ -1379,7 +1416,7 @@ def discover_vcf_shape(vcfs, *, ploidy=None, worker_processes=0, show_progress=F
     )
     with core.ParallelWorkManager(worker_processes, progress) as pwm:
         for index in range(len(metadata.partitions)):
-            pwm.submit(discover_vcf_partition, metadata, index, ploidy)
+            pwm.submit(discover_vcf_partition, metadata, index, ploidy, max_alleles)
         summaries = list(pwm.results_as_completed())
     total = 0
     for index, summary in summaries:
@@ -1513,8 +1550,12 @@ class DirectVcfSource(VcfSource):
             )
 
     def validate_row(self, row, schema):
-        if len(row["ALT"]) + 1 > schema.dimensions["alleles"].size:
-            raise ValueError("Number of alleles exceeds discovered schema width")
+        allele_count = len(row["ALT"]) + 1
+        if allele_count > schema.dimensions["alleles"].size:
+            raise ValueError(
+                f"Allele count {allele_count} exceeds max_alleles="
+                f"{schema.dimensions['alleles'].size} (including REF)"
+            )
         gt = row.get("FORMAT/GT")
         if gt is not None:
             ploidy = schema.dimensions["ploidy"].size
@@ -1532,6 +1573,16 @@ class DirectVcfSource(VcfSource):
             if value is None:
                 continue
             field = self.fields[name].vcf_field
+            if field.vcf_number == "A" and value.shape[-1] != allele_count - 1:
+                raise ValueError(
+                    f"{name} has {value.shape[-1]} values but Number=A requires "
+                    f"{allele_count - 1}"
+                )
+            if field.vcf_number == "R" and value.shape[-1] != allele_count:
+                raise ValueError(
+                    f"{name} has {value.shape[-1]} values but Number=R requires "
+                    f"{allele_count}"
+                )
             if field.name != "GT" and value.shape[-1] > field.max_number:
                 raise ValueError(f"{name} exceeds discovered field width")
             if field.vcf_type == "Integer":
@@ -1969,6 +2020,7 @@ def convert(
     worker_processes=core.DEFAULT_WORKER_PROCESSES,
     local_alleles=None,
     ploidy=None,
+    max_alleles=None,
     show_progress=False,
     icf_path=None,
     zarr_format=None,
@@ -2015,18 +2067,27 @@ def convert(
     ploidy : int, optional
         Pad genotypes to this ploidy and reject genotypes exceeding it.
         With infer_shape, skip genotype discovery when this is supplied.
+    max_alleles : int, optional
+        Maximum number of alleles including REF (at least 2). Supported only
+        with infer_shape=True; it sizes allele-dependent dimensions and rejects
+        records exceeding the bound. It does not change the default ICF mode.
     infer_shape : bool
         Read the input twice without storing intermediate columns: discover
         dimensions and dtypes, then convert bounded chunks. Discovery and
         encoding use worker_processes; the second input pass is sequential.
         Cannot be combined with icf_path. Oversized chunks raise ValueError;
-        reduce variants_chunk_size or use the default ICF conversion.
+        reduce variants_chunk_size or use the default ICF conversion. Bounds
+        are not supported by default ICF conversion or custom-schema encoding.
 
     Returns
     -------
     zarr.Group
         The root group of the Zarr store containing the converted data.
     """
+    if max_alleles is not None:
+        validate_max_alleles(max_alleles)
+        if not infer_shape:
+            raise ValueError("max_alleles requires infer_shape=True")
     if infer_shape:
         if icf_path is not None:
             raise ValueError("No-ICF conversion cannot specify icf_path")
@@ -2034,6 +2095,7 @@ def convert(
         metadata, header = discover_vcf_shape(
             vcfs,
             ploidy=ploidy,
+            max_alleles=max_alleles,
             worker_processes=worker_processes,
             show_progress=show_progress,
         )
@@ -2043,6 +2105,7 @@ def convert(
             samples_chunk_size=samples_chunk_size,
             local_alleles=local_alleles,
             ploidy=ploidy,
+            max_alleles=max_alleles,
         )
         with vcz.open_zarr(vcz_path, mode=mode) as zr:
             writer = vcz.VcfZarrWriter(DirectVcfSource, zr.dir, zarr_format)
