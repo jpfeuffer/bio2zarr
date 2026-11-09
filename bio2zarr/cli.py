@@ -529,6 +529,11 @@ def dencode_finalise(zarr_path, verbose, progress):
     is_flag=True,
     help="Read input twice to infer dimensions and dtypes without ICF storage.",
 )
+@click.option(
+    "--direct-memory-budget",
+    default=None,
+    help="Approximate memory budget for --infer-shape (e.g. 1GiB).",
+)
 def convert_vcf(
     vcfs,
     zarr_path,
@@ -542,11 +547,23 @@ def convert_vcf(
     ploidy,
     zarr_format,
     infer_shape,
+    direct_memory_budget,
 ):
     """
     Convert input VCF(s) to VCF Zarr.
     """
     setup_logging(verbose)
+    if direct_memory_budget is not None:
+        if not infer_shape:
+            raise click.BadParameter(
+                "requires --infer-shape", param_hint="--direct-memory-budget"
+            )
+        try:
+            direct_memory_budget = vcf_mod.resolve_direct_vcf_memory_budget(
+                direct_memory_budget
+            )
+        except ValueError as e:
+            raise click.BadParameter(str(e), param_hint="--direct-memory-budget") from e
     check_overwrite_dir(zarr_path, force)
     vcf_mod.convert(
         vcfs,
@@ -559,6 +576,7 @@ def convert_vcf(
         ploidy=ploidy,
         zarr_format=zarr_format,
         infer_shape=infer_shape,
+        direct_memory_budget=direct_memory_budget,
     )
 
 

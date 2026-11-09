@@ -73,6 +73,7 @@ DEFAULT_CONVERT_ARGS = dict(
     ploidy=None,
     zarr_format=None,
     infer_shape=False,
+    direct_memory_budget=None,
 )
 
 DEFAULT_TSKIT_CONVERT_ARGS = dict(
@@ -655,12 +656,48 @@ class TestWithMocks:
         runner = ct.CliRunner()
         result = runner.invoke(
             cli.vcf2zarr_main,
-            ["convert", self.vcf_path, "zarr_path", "--infer-shape", "--ploidy", "2"],
+            [
+                "convert",
+                self.vcf_path,
+                "zarr_path",
+                "--infer-shape",
+                "--ploidy",
+                "2",
+                "--direct-memory-budget",
+                "1GiB",
+            ],
             catch_exceptions=False,
         )
         assert result.exit_code == 0
-        args = dict(DEFAULT_CONVERT_ARGS, infer_shape=True, ploidy=2)
+        args = dict(
+            DEFAULT_CONVERT_ARGS,
+            infer_shape=True,
+            ploidy=2,
+            direct_memory_budget=1024**3,
+        )
         mocked.assert_called_once_with((self.vcf_path,), "zarr_path", **args)
+
+    @mock.patch("bio2zarr.cli.check_overwrite_dir")
+    @mock.patch("bio2zarr.vcf.convert")
+    def test_direct_memory_budget_requires_infer_shape(
+        self, mocked_convert, mocked_overwrite
+    ):
+        runner = ct.CliRunner()
+        result = runner.invoke(
+            cli.vcf2zarr_main,
+            [
+                "convert",
+                self.vcf_path,
+                "zarr_path",
+                "--direct-memory-budget",
+                "1GiB",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 2
+        assert "requires --infer-shape" in result.output
+        mocked_convert.assert_not_called()
+        mocked_overwrite.assert_not_called()
 
     @pytest.mark.parametrize("response", ["n", "N", "No"])
     @mock.patch("bio2zarr.vcf.convert")

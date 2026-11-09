@@ -180,6 +180,32 @@ class TestSmallExample:
                 [self.data_path], infer_shape=True, icf_path=tmp_path / "icf"
             )
 
+    def test_direct_memory_budget(self):
+        with mock.patch.object(vcf_mod, "DIRECT_VCF_MEMORY_BUDGET", 1024):
+            root = vcf_mod.convert(
+                [self.data_path],
+                infer_shape=True,
+                direct_memory_budget="1 MiB",
+            )
+        assert root["variant_position"].shape == (9,)
+
+    def test_direct_memory_budget_requires_no_icf(self):
+        with pytest.raises(ValueError, match="requires infer_shape=True"):
+            vcf_mod.convert(
+                [self.data_path],
+                infer_shape=False,
+                direct_memory_budget=1024,
+            )
+
+    @pytest.mark.parametrize("memory_budget", [0, -1, 1.5, True])
+    def test_invalid_direct_memory_budget(self, memory_budget):
+        with pytest.raises(ValueError, match="positive number of bytes"):
+            vcf_mod.convert(
+                [self.data_path],
+                infer_shape=True,
+                direct_memory_budget=memory_budget,
+            )
+
     def test_oversized_chunk(self):
         with (
             mock.patch.object(vcf_mod, "DIRECT_VCF_MEMORY_BUDGET", 1024),
@@ -237,10 +263,42 @@ class TestSmallExample:
                 infer_shape=True,
                 variants_chunk_size=1,
                 worker_processes=4,
+                direct_memory_budget=budget,
             )
         assert root["variant_position"].shape == (9,)
         assert max(admitted_bytes) <= budget // 2
         assert max(admitted_rows) == 2
+
+    def test_exact_chunk_admission_threshold(self, tmp_path):
+        metadata, header = vcf_mod.discover_vcf_shape([self.data_path])
+        source = vcf_mod.DirectVcfSource(metadata, header, self.data_path)
+        schema = source.generate_schema(variants_chunk_size=9)
+        writer = vcz.VcfZarrWriter(vcf_mod.DirectVcfSource, tmp_path / "estimate")
+        writer.metadata = vcz.VcfZarrWriterMetadata(
+            format_version=vcz.VZW_METADATA_FORMAT_VERSION,
+            source_path=self.data_path,
+            schema=schema,
+            partitions=[],
+            provenance={},
+        )
+        encoding_memory = 3 * writer.get_max_encoding_memory()
+        chunk = next(source.iter_chunks(schema, encoding_memory))
+        exact_budget = 2 * (3 * chunk.nbytes + encoding_memory)
+
+        root = vcf_mod.convert(
+            [self.data_path],
+            infer_shape=True,
+            variants_chunk_size=9,
+            direct_memory_budget=exact_budget,
+        )
+        assert root["variant_position"].shape == (9,)
+        with pytest.raises(ValueError, match="chunk exceeds the no-ICF memory budget"):
+            vcf_mod.convert(
+                [self.data_path],
+                infer_shape=True,
+                variants_chunk_size=9,
+                direct_memory_budget=exact_budget - 1,
+            )
 
     @pytest.mark.parametrize("value", ["1,200", "1,2,3"])
     def test_changed_input_overflow(self, tmp_path, value):

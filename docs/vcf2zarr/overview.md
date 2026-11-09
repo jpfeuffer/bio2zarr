@@ -100,6 +100,7 @@ Use `--infer-shape` when intermediate storage is unavailable:
 ```bash
 vcf2zarr convert sample.vcf.gz sample.vcz --infer-shape
 vcf2zarr convert sample.vcf.gz sample.vcz --infer-shape --ploidy 2
+vcf2zarr convert sample.vcf.gz sample.vcz --infer-shape --direct-memory-budget 1GiB
 ```
 
 This reads the input twice: first to discover dimensions and dtypes, then to
@@ -111,8 +112,12 @@ Discovery and encoding use `--worker-processes`, but reading the second pass
 is sequential. Unindexed files are scanned serially per file. For large indexed
 inputs, the default ICF workflow may be faster. Oversized chunks, invalid allele
 indices, and values exceeding discovered widths or dtypes raise errors rather
-than being truncated. If a chunk exceeds the memory budget, reduce
-`--variants-chunk-size` or use the default ICF workflow.
+than being truncated. The approximate direct-conversion memory budget defaults
+to 256 MiB and can be changed with `--direct-memory-budget` (for example,
+`1GiB`). It bounds estimated payload and encoding buffers, not process RSS;
+worker processes can retain additional queued copies. This budget does not split
+output chunks: if one chunk exceeds it, reduce `--variants-chunk-size` or use
+the default ICF workflow.
 
 ## Local alleles
 

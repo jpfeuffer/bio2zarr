@@ -4,6 +4,7 @@ import dataclasses
 import json
 import logging
 import math
+import numbers
 import pathlib
 import pickle
 import re
@@ -128,6 +129,24 @@ ICF_DEFAULT_COMPRESSOR = numcodecs.Blosc(
     cname="zstd", clevel=7, shuffle=numcodecs.Blosc.NOSHUFFLE
 )
 DIRECT_VCF_MEMORY_BUDGET = 256 * 1024**2
+
+
+def resolve_direct_vcf_memory_budget(memory_budget):
+    if memory_budget is None:
+        return DIRECT_VCF_MEMORY_BUDGET
+    if isinstance(memory_budget, str):
+        memory_budget = core.parse_max_memory(memory_budget)
+    if isinstance(memory_budget, bool) or not isinstance(
+        memory_budget, numbers.Integral
+    ):
+        raise ValueError("direct_memory_budget must be a positive number of bytes")
+    if memory_budget <= 0:
+        raise ValueError("direct_memory_budget must be a positive number of bytes")
+    return int(memory_budget)
+
+
+def direct_vcf_memory_budget_or_default(memory_budget):
+    return DIRECT_VCF_MEMORY_BUDGET if memory_budget is None else memory_budget
 
 
 @dataclasses.dataclass
@@ -1322,8 +1341,9 @@ def value_nbytes(value):
     return size
 
 
-def summarise_vcf_variants(variants, metadata, ploidy):
+def summarise_vcf_variants(variants, metadata, ploidy, memory_budget=None):
     """Reduce one owned input region without retaining its rows."""
+    memory_budget = direct_vcf_memory_budget_or_default(memory_budget)
     fields = [
         dataclasses.replace(field, summary=VcfFieldSummary())
         for field in metadata.fields
@@ -1337,13 +1357,13 @@ def summarise_vcf_variants(variants, metadata, ploidy):
     for variant in variants:
         values = variant_values(variant, metadata, genotypes=ploidy is None)
         row_bytes = sum(value_nbytes(value) for value in values.values())
-        if 3 * row_bytes > DIRECT_VCF_MEMORY_BUDGET // 2:
+        if 3 * row_bytes > memory_budget // 2:
             raise ValueError(
                 "VCF row exceeds the no-ICF memory budget; use ICF conversion"
             )
         for name, value in values.items():
             transformed = transformers[name].transform_and_update_bounds(value)
-            if 3 * value_nbytes(transformed) > DIRECT_VCF_MEMORY_BUDGET // 2:
+            if 3 * value_nbytes(transformed) > memory_budget // 2:
                 raise ValueError(
                     "VCF field exceeds the no-ICF memory budget; use ICF conversion"
                 )
@@ -1357,15 +1377,22 @@ def summarise_vcf_variants(variants, metadata, ploidy):
     )
 
 
-def discover_vcf_partition(metadata, partition_index, ploidy):
+def discover_vcf_partition(metadata, partition_index, ploidy, memory_budget=None):
     partition = metadata.partitions[partition_index]
     with vcf_utils.VcfFile(partition.vcf_path) as file:
         return partition_index, summarise_vcf_variants(
-            file.variants(partition.region), metadata, ploidy
+            file.variants(partition.region), metadata, ploidy, memory_budget
         )
 
 
-def discover_vcf_shape(vcfs, *, ploidy=None, worker_processes=0, show_progress=False):
+def discover_vcf_shape(
+    vcfs,
+    *,
+    ploidy=None,
+    worker_processes=0,
+    show_progress=False,
+    memory_budget=None,
+):
     metadata, header = scan_vcfs(
         vcfs, show_progress, max(1, worker_processes * 4), worker_processes
     )
@@ -1379,7 +1406,7 @@ def discover_vcf_shape(vcfs, *, ploidy=None, worker_processes=0, show_progress=F
     )
     with core.ParallelWorkManager(worker_processes, progress) as pwm:
         for index in range(len(metadata.partitions)):
-            pwm.submit(discover_vcf_partition, metadata, index, ploidy)
+            pwm.submit(discover_vcf_partition, metadata, index, ploidy, memory_budget)
         summaries = list(pwm.results_as_completed())
     total = 0
     for index, summary in summaries:
@@ -1451,7 +1478,8 @@ class DirectVcfSource(VcfSource):
             )
         )
 
-    def iter_chunks(self, schema, encoding_memory):
+    def iter_chunks(self, schema, encoding_memory, memory_budget=None):
+        memory_budget = direct_vcf_memory_budget_or_default(memory_budget)
         transformers = {
             name: VcfValueTransformer.factory(field.vcf_field, self.num_samples)
             for name, field in self.fields.items()
@@ -1475,10 +1503,7 @@ class DirectVcfSource(VcfSource):
                     }
                     self.validate_row(row, schema)
                     buffered_bytes += sum(value_nbytes(v) + 16 for v in row.values())
-                    if (
-                        3 * buffered_bytes + encoding_memory
-                        > DIRECT_VCF_MEMORY_BUDGET // 2
-                    ):
+                    if 3 * buffered_bytes + encoding_memory > memory_budget // 2:
                         raise ValueError(
                             "VCF chunk exceeds the no-ICF memory budget; "
                             "reduce variants_chunk_size or use ICF conversion"
@@ -1559,7 +1584,10 @@ def encode_vcf_chunk(path, zarr_format, partition_index, source):
         writer.source = None
 
 
-def encode_direct_vcf(source, writer, *, worker_processes, show_progress):
+def encode_direct_vcf(
+    source, writer, *, worker_processes, show_progress, memory_budget=None
+):
+    memory_budget = direct_vcf_memory_budget_or_default(memory_budget)
     encoding_memory = 3 * writer.get_max_encoding_memory()
     progress = core.ProgressConfig(
         total=sum(
@@ -1573,17 +1601,17 @@ def encode_direct_vcf(source, writer, *, worker_processes, show_progress):
     try:
         with core.ParallelWorkManager(worker_processes, progress) as pwm:
             admitted = 0
-            chunks = source.iter_chunks(writer.schema, encoding_memory)
+            chunks = source.iter_chunks(writer.schema, encoding_memory, memory_budget)
             with contextlib.closing(chunks):
                 for index, chunk in enumerate(chunks):
                     charge = 3 * chunk.nbytes + encoding_memory
-                    if charge > DIRECT_VCF_MEMORY_BUDGET // 2:
+                    if charge > memory_budget // 2:
                         raise ValueError(
                             "VCF chunk exceeds the no-ICF memory budget; "
                             "reduce variants_chunk_size or use ICF conversion"
                         )
                     if pwm.futures and (
-                        admitted + charge > DIRECT_VCF_MEMORY_BUDGET // 2
+                        admitted + charge > memory_budget // 2
                         or len(pwm.futures) >= max(1, worker_processes)
                     ):
                         list(pwm.results_as_completed())
@@ -1973,6 +2001,7 @@ def convert(
     icf_path=None,
     zarr_format=None,
     infer_shape=False,
+    direct_memory_budget=None,
 ):
     """
     Convert VCF file(s) to VCF Zarr format.
@@ -2021,12 +2050,20 @@ def convert(
         encoding use worker_processes; the second input pass is sequential.
         Cannot be combined with icf_path. Oversized chunks raise ValueError;
         reduce variants_chunk_size or use the default ICF conversion.
+    direct_memory_budget : int or str, optional
+        Approximate memory budget for direct conversion, in bytes or a
+        human-readable size (for example, ``"1 GiB"``). Only used with
+        infer_shape; defaults to 256 MiB.
 
     Returns
     -------
     zarr.Group
         The root group of the Zarr store containing the converted data.
     """
+    if direct_memory_budget is not None:
+        if not infer_shape:
+            raise ValueError("direct_memory_budget requires infer_shape=True")
+        direct_memory_budget = resolve_direct_vcf_memory_budget(direct_memory_budget)
     if infer_shape:
         if icf_path is not None:
             raise ValueError("No-ICF conversion cannot specify icf_path")
@@ -2036,6 +2073,7 @@ def convert(
             ploidy=ploidy,
             worker_processes=worker_processes,
             show_progress=show_progress,
+            memory_budget=direct_memory_budget,
         )
         source = DirectVcfSource(metadata, header, str(vcfs[0]))
         schema = source.generate_schema(
@@ -2061,6 +2099,7 @@ def convert(
                 writer,
                 worker_processes=worker_processes,
                 show_progress=show_progress,
+                memory_budget=direct_memory_budget,
             )
             writer.finalise(show_progress)
             writer.create_index()
