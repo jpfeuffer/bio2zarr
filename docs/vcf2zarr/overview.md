@@ -107,12 +107,20 @@ write Zarr without storing ICF columns. Input files must remain unchanged
 between passes. `--ploidy` pads genotypes to the supplied size, skips genotype
 discovery, and rejects genotypes exceeding that size.
 
-Discovery and encoding use `--worker-processes`, but reading the second pass
-is sequential. Unindexed files are scanned serially per file. For large indexed
-inputs, the default ICF workflow may be faster. Oversized chunks, invalid allele
-indices, and values exceeding discovered widths or dtypes raise errors rather
-than being truncated. If a chunk exceeds the memory budget, reduce
-`--variants-chunk-size` or use the default ICF workflow.
+Discovery and encoding use `--worker-processes`. In the second pass each worker
+reads its original input region once and writes bounded batches to private
+partition staging. A single finaliser reconciles output chunks crossing region
+boundaries; workers never concurrently update the same physical output chunk.
+Unindexed single files and large runs of duplicate positions may have only one
+useful worker. This is a local-storage prototype, not a remote-store performance
+claim.
+
+Batch size is independent of total input length and may be smaller than an output
+chunk. The fixed memory budget covers batch and encoding buffers, not hard process
+RSS. Oversized rows or individual codec chunks, invalid allele indices, and values
+exceeding discovered widths or dtypes raise errors rather than being truncated.
+If a codec chunk exceeds the budget, reduce `--variants-chunk-size` or
+`--samples-chunk-size`, or use the default ICF workflow.
 
 ## Local alleles
 

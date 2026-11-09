@@ -3,7 +3,6 @@ import pathlib
 import re
 import shutil
 import sys
-import weakref
 from functools import partial
 from unittest import mock
 
@@ -99,8 +98,6 @@ class TestSmallExample:
         scan_records = 0
         genotype_decodes = 0
         chunks = []
-        live = weakref.WeakSet()
-        retained_rows = []
         original_variants = vcf_mod.vcf_utils.VcfFile.variants
         original_encode = vcf_mod.encode_vcf_chunk
         original_scan = vcf_mod.scan_vcf
@@ -139,17 +136,15 @@ class TestSmallExample:
             scan_records += records - before
             return result
 
-        def encode(path, zarr_format, index, source):
-            live.add(source)
-            retained_rows.append(sum(chunk.num_rows for chunk in live))
-            chunks.append((source.start, source.num_rows, source.nbytes))
+        def encode(path, zarr_format, index, source, *controls):
+            before = records
             assert isinstance(source, vcz.Source)
             assert not isinstance(source, vcf_mod.IntermediateColumnarFormat)
-            assert all(
-                isinstance(field, vcf_mod.DirectVcfField)
-                for field in source.fields.values()
+            assert all(not field.values for field in source.fields.values())
+            original_encode(path, zarr_format, index, source, *controls)
+            chunks.append(
+                (source.metadata.partitions[index].num_records, records - before)
             )
-            original_encode(path, zarr_format, index, source)
 
         with (
             mock.patch.object(vcf_mod.vcf_utils.VcfFile, "variants", variants),
@@ -161,11 +156,8 @@ class TestSmallExample:
         assert records - scan_records == (18 if conversion_mode else 9)
         assert genotype_decodes == (18 if conversion_mode and ploidy is None else 9)
         if conversion_mode:
-            assert [(start, rows) for start, rows, _ in chunks] == [
-                (index, 1) for index in range(9)
-            ]
-            assert max(retained_rows) <= 2
-            assert max(size for _, _, size in chunks) < 64 * 1024
+            assert sum(rows for rows, _ in chunks) == 9
+            assert all(rows == parsed for rows, parsed in chunks)
         else:
             assert chunks == []
 
@@ -187,50 +179,35 @@ class TestSmallExample:
         ):
             vcf_mod.convert([self.data_path], infer_shape=True)
 
-    def test_byte_bounded_admission(self, tmp_path):
-        metadata, header = vcf_mod.discover_vcf_shape([self.data_path])
-        source = vcf_mod.DirectVcfSource(metadata, header, self.data_path)
-        schema = source.generate_schema(variants_chunk_size=1)
-        writer = vcz.VcfZarrWriter(vcf_mod.DirectVcfSource, tmp_path / "estimate")
-        writer.metadata = vcz.VcfZarrWriterMetadata(
-            format_version=vcz.VZW_METADATA_FORMAT_VERSION,
-            source_path=self.data_path,
-            schema=schema,
-            partitions=[],
-            provenance={},
-        )
-        encoding_memory = 3 * writer.get_max_encoding_memory()
-        max_charge = max(
-            3 * chunk.nbytes + encoding_memory
-            for chunk in source.iter_chunks(schema, encoding_memory)
-        )
-        budget = 2 * (2 * max_charge + 1)
-        admitted_bytes = []
-        admitted_rows = []
+    def test_byte_bounded_admission(self):
+        budget = 1024 * 1024
+        worker_counts = []
+        worker_budgets = []
+        batch_sizes = []
+        original_batches = vcf_mod.DirectVcfSource.iter_batches
 
         class SerialWorkManager(core.ParallelWorkManager):
             def __init__(self, workers, progress):
+                worker_counts.append(workers)
                 super().__init__(0, progress)
-                self.charge = 0
-                self.rows = 0
 
             def submit(self, fn, *args, **kwargs):
                 if fn is vcf_mod.encode_vcf_chunk:
-                    chunk = args[-1]
-                    self.charge += 3 * chunk.nbytes + encoding_memory
-                    self.rows += chunk.num_rows
-                    admitted_bytes.append(self.charge)
-                    admitted_rows.append(self.rows)
+                    worker_budgets.append(args[4])
+                    assert all(not field.values for field in args[3].fields.values())
                 return super().submit(fn, *args, **kwargs)
 
-            def results_as_completed(self):
-                yield from super().results_as_completed()
-                self.charge = 0
-                self.rows = 0
+        def batches(source, *args, **kwargs):
+            for batch in original_batches(source, *args, **kwargs):
+                size = vcz.batch_nbytes(batch)
+                batch_sizes.append(size)
+                assert size <= kwargs["max_bytes"]
+                yield batch
 
         with (
             mock.patch.object(core, "ParallelWorkManager", SerialWorkManager),
             mock.patch.object(vcf_mod, "DIRECT_VCF_MEMORY_BUDGET", budget),
+            mock.patch.object(vcf_mod.DirectVcfSource, "iter_batches", batches),
         ):
             root = vcf_mod.convert(
                 [self.data_path],
@@ -239,8 +216,8 @@ class TestSmallExample:
                 worker_processes=4,
             )
         assert root["variant_position"].shape == (9,)
-        assert max(admitted_bytes) <= budget // 2
-        assert max(admitted_rows) == 2
+        assert worker_counts[-1] * max(worker_budgets) <= budget
+        assert batch_sizes
 
     def test_row_validation_plan_built_once(self):
         metadata, header = vcf_mod.discover_vcf_shape([self.data_path])
@@ -256,11 +233,132 @@ class TestSmallExample:
                 vcf_mod.VcfField, "smallest_dtype", autospec=True, side_effect=dtype
             ) as dtype_lookup,
         ):
-            chunks = list(source.iter_chunks(schema, 0))
-        assert sum(chunk.num_rows for chunk in chunks) == 9
-        assert schema_lookup.call_count == 1
+            rows = []
+            offset = 0
+            for index, partition in enumerate(metadata.partitions):
+                source.partition_index = index
+                rows.extend(
+                    source.iter_transformed_rows(
+                        schema, offset, offset + partition.num_records, 256 * 1024**2
+                    )
+                )
+                offset += partition.num_records
+        assert len(rows) == 9
+        assert schema_lookup.call_count == len(metadata.partitions)
         integer_fields = sum(field.vcf_type == "Integer" for field in metadata.fields)
-        assert dtype_lookup.call_count == integer_fields
+        assert dtype_lookup.call_count == integer_fields * len(metadata.partitions)
+
+    @pytest.mark.parametrize(
+        ("batch_rows", "buffer_rows"), [(1, 3), (3, 3), (6, 3), (4, 2)]
+    )
+    def test_batch_buffer_controls(self, tmp_path, batch_rows, buffer_rows):
+        icf = vcf_mod.explode(tmp_path / "icf", [self.data_path])
+        expected = vcf_mod.encode(icf.path, variants_chunk_size=3)
+        with (
+            mock.patch.object(vcz.VcfZarrWriter, "batch_rows", batch_rows),
+            mock.patch.object(vcz.VcfZarrWriter, "buffer_rows", buffer_rows),
+        ):
+            actual = vcf_mod.convert(
+                [self.data_path], infer_shape=True, variants_chunk_size=3
+            )
+            # The same adapter and sink also work with stored ICF columns.
+            with mock.patch.object(
+                vcf_mod.IntermediateColumnarFormat, "prefer_batch_encoding", True
+            ):
+                writer = vcz.VcfZarrWriter(
+                    vcf_mod.IntermediateColumnarFormat, tmp_path / "shared"
+                )
+                writer.memory_budget = vcf_mod.DIRECT_VCF_MEMORY_BUDGET
+                writer.init(
+                    icf,
+                    schema=icf.generate_schema(variants_chunk_size=3),
+                    target_num_partitions=1,
+                )
+                writer.encode_partition(0)
+                writer.finalise()
+                writer.create_index()
+                assert_zarr_equal(expected, zarr.open_group(writer.path, mode="r"))
+        assert_zarr_equal(expected, actual)
+
+    @pytest.mark.parametrize("zarr_format", [2, 3])
+    @pytest.mark.parametrize("workers", [0, 2])
+    def test_owned_region_boundaries(self, tmp_path, zarr_format, workers):
+        paths = []
+        for file in range(3):
+            path = tmp_path / f"part{file}.vcf"
+            path.write_text(
+                "##fileformat=VCFv4.3\n"
+                + "".join(f"##contig=<ID=c{j}>\n" for j in range(3))
+                + '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+                '##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Depth">\n'
+                '##FORMAT=<ID=PL,Number=G,Type=Integer,Description="Likelihood">\n'
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts0\ts1\ts2\n"
+                + "".join(
+                    f"c{file}\t{row // 2 + 1}\tid{file}{row}\tA\tC\t.\t.\t."
+                    "\tGT:AD:PL\t0/1:2,3:1,2,3\t./.:.:.\t1|1:4,5:4,5,6\n"
+                    for row in range(5)
+                )
+            )
+            paths.append(path)
+        icf = vcf_mod.explode(tmp_path / "icf", paths)
+        options = dict(
+            variants_chunk_size=8,
+            samples_chunk_size=2,
+            zarr_format=zarr_format,
+            local_alleles=True,
+        )
+        expected = vcf_mod.encode(icf.path, **options)
+        with mock.patch.object(vcz.VcfZarrWriter, "batch_rows", 3):
+            actual = vcf_mod.convert(
+                paths, infer_shape=True, worker_processes=workers, **options
+            )
+        assert_zarr_equal(expected, actual)
+
+    def test_output_chunk_larger_than_batch(self, tmp_path, conversion_mode):
+        if not conversion_mode:
+            pytest.skip("Direct batch memory contract")
+        path = tmp_path / "large-chunk.vcf"
+        samples = 1000
+        path.write_text(
+            "##fileformat=VCFv4.3\n##contig=<ID=1>\n"
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+            '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth">\n'
+            '##FORMAT=<ID=PL,Number=G,Type=Integer,Description="Likelihood">\n'
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
+            + "\t".join(f"s{s}" for s in range(samples))
+            + "\n"
+            + "".join(
+                f"1\t{row + 1}\t.\tA\tC\t.\t.\t.\tGT:DP:PL\t"
+                + "\t".join(["0/1:3:0,1,2"] * samples)
+                + "\n"
+                for row in range(4096)
+            )
+        )
+        effective = []
+        original = vcf_mod.DirectVcfSource.iter_batches
+
+        def batches(source, *args, **kwargs):
+            for batch in original(source, *args, **kwargs):
+                effective.append(len(batch["call_genotype"]))
+                assert vcz.batch_nbytes(batch) <= kwargs["max_bytes"]
+                yield batch
+
+        with mock.patch.object(vcf_mod.DirectVcfSource, "iter_batches", batches):
+            actual = vcf_mod.convert(
+                [path],
+                infer_shape=True,
+                variants_chunk_size=4096,
+                samples_chunk_size=samples,
+            )
+        assert 0 < max(effective) < 4096
+        assert sum(effective) == 4096
+        assert actual["call_genotype"].chunks == (4096, samples, 2)
+        nt.assert_array_equal(
+            actual["call_genotype"][:], np.tile([0, 1], (4096, samples, 1))
+        )
+        nt.assert_array_equal(
+            actual["call_PL"][:], np.tile([0, 1, 2], (4096, samples, 1))
+        )
 
     @pytest.mark.parametrize("value", ["1,200", "1,2,3"])
     def test_changed_input_overflow(self, tmp_path, value):
@@ -332,7 +430,7 @@ class TestSmallExample:
         with (
             mock.patch.object(vcf_mod.vcf_utils.VcfFile, "__enter__", enter),
             mock.patch.object(
-                vcf_mod, "encode_vcf_chunk", side_effect=ValueError("encoding failed")
+                vcf_mod, "vcf_filters", side_effect=ValueError("encoding failed")
             ),
             pytest.raises(ValueError, match="encoding failed"),
         ):
@@ -382,7 +480,6 @@ class TestSmallExample:
                 variants_chunk_size=1,
                 worker_processes=2,
             )
-        assert opened
         assert all(file.vcf is None for file in opened)
         assert vcf_mod.direct_vcf_writer.cache_info().currsize == 0
 

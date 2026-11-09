@@ -3,9 +3,11 @@ import contextlib
 import dataclasses
 import json
 import logging
+import math
 import os
 import pathlib
 import shutil
+import sys
 import tempfile
 
 import numpy as np
@@ -48,6 +50,14 @@ _fixed_field_descriptions = {
 }
 
 
+def batch_nbytes(batch):
+    size = sum(a.nbytes for a in batch.values())
+    for array in batch.values():
+        if array.dtype.kind in ("T", "O", "U"):
+            size += sum(sys.getsizeof(value) for value in array.flat)
+    return size
+
+
 @dataclasses.dataclass
 class VariantData:
     """Represents variant data returned by iter_alleles_and_genotypes."""
@@ -59,6 +69,11 @@ class VariantData:
 
 
 class Source(abc.ABC):
+    prefer_batch_encoding = False
+
+    def iter_batches(self, schema, start, stop, *, batch_rows, max_bytes):
+        raise NotImplementedError("This source does not support batch encoding")
+
     @property
     @abc.abstractmethod
     def path(self):
@@ -666,6 +681,10 @@ def encode(
 
 
 class VcfZarrWriter:
+    # Internal experiment controls; None selects a byte-bounded chunk-sized batch.
+    batch_rows = None
+    buffer_rows = None
+
     def __init__(self, source_type, path, zarr_format=None):
         self.source_type = source_type
         self.path = pathlib.Path(path)
@@ -899,6 +918,9 @@ class VcfZarrWriter:
         os.rename(partition_path, final_path)
 
     def encode_partition_fields(self, partition_index):
+        if self.source.prefer_batch_encoding:
+            self.encode_partition_batches(partition_index)
+            return
         all_field_names = [field.name for field in self.schema.fields]
         if "variant_id" in all_field_names:
             self.encode_id_partition(partition_index)
@@ -915,6 +937,133 @@ class VcfZarrWriter:
         if self.has_local_alleles():
             self.encode_local_alleles_partition(partition_index)
             self.encode_local_allele_fields_partition(partition_index)
+
+    def encoding_memory(self):
+        row_bytes = 0
+        codec_bytes = 0
+        for field in self.schema.fields:
+            shape = field.get_shape(self.schema)
+            chunks = self.schema.get_chunks(field.dimensions)
+            itemsize = np.dtype(field.dtype).itemsize
+            row_bytes += math.prod(shape[1:]) * itemsize
+            codec_bytes = max(
+                codec_bytes,
+                math.prod(chunks) * itemsize,
+            )
+        return row_bytes, codec_bytes
+
+    def encode_partition_batches(self, partition_index):
+        partition = self.metadata.partitions[partition_index]
+        row_bytes, codec_bytes = self.encoding_memory()
+        available = self.memory_budget - 3 * (
+            codec_bytes + getattr(self.source, "metadata_nbytes", 0)
+        )
+        if available < 8 * row_bytes:
+            raise ValueError("VCF codec chunk exceeds the no-ICF memory budget")
+        payload_budget = available // 8
+        chunk_rows = self.schema.dimensions["variants"].chunk_size
+        automatic_rows = max(1, min(chunk_rows, payload_budget // max(1, row_bytes)))
+        batch_rows = automatic_rows if self.batch_rows is None else self.batch_rows
+        buffer_rows = automatic_rows if self.buffer_rows is None else self.buffer_rows
+        if batch_rows <= 0 or buffer_rows <= 0:
+            raise ValueError("Batch and buffer rows must be positive")
+        if max(batch_rows, buffer_rows) * row_bytes > payload_budget:
+            raise ValueError(
+                "Requested batch or buffer exceeds the no-ICF memory budget"
+            )
+        arrays = {
+            f.name: self.open_partition_array(partition_index, f.name)
+            for f in self.schema.fields
+        }
+        buffers = {}
+        used = 0
+        start = partition.start
+        peak_buffer_bytes = 0
+        buffered_bytes = 0
+
+        def flush(values):
+            nonlocal start
+            count = len(next(iter(values.values())))
+            for name, array in arrays.items():
+                if array.ndim == 1:
+                    core.sync_flush_1d_array(values[name], array, start)
+                else:
+                    core.sync_flush_2d_array(values[name], array, start)
+            start += count
+
+        batches = self.source.iter_batches(
+            self.schema,
+            start,
+            partition.stop,
+            batch_rows=batch_rows,
+            max_bytes=payload_budget,
+        )
+        with contextlib.closing(batches):
+            for batch in batches:
+                count = len(next(iter(batch.values())))
+                if set(batch) != set(arrays) or any(
+                    len(a) != count for a in batch.values()
+                ):
+                    raise ValueError("Source batch does not match output fields")
+                if count == 0 or start + used + count > partition.stop:
+                    raise ValueError("Source batch exceeds its owned interval")
+                offset = 0
+                while offset < count:
+                    capacity = min(
+                        buffer_rows,
+                        chunk_rows - start % chunk_rows,
+                        partition.stop - start,
+                    )
+                    take = min(capacity - used, count - offset)
+                    piece = {n: a[offset : offset + take] for n, a in batch.items()}
+                    piece_bytes = batch_nbytes(piece)
+                    if used and buffered_bytes + piece_bytes > payload_budget:
+                        flush({n: a[:used] for n, a in buffers.items()})
+                        buffers = {}
+                        used = 0
+                        buffered_bytes = 0
+                        continue
+                    if not used and take == capacity:
+                        flush(piece)
+                        peak_buffer_bytes = max(peak_buffer_bytes, piece_bytes)
+                    else:
+                        if not used:
+                            buffers = {
+                                n: np.empty((capacity, *a.shape[1:]), dtype=a.dtype)
+                                for n, a in arrays.items()
+                            }
+                            buffered_bytes = sum(a.nbytes for a in buffers.values())
+                        for name, array in buffers.items():
+                            array[used : used + take] = piece[name]
+                        used += take
+                        buffered_bytes += piece_bytes - row_bytes * take
+                        peak_buffer_bytes = max(peak_buffer_bytes, buffered_bytes)
+                        if buffered_bytes > 2 * payload_budget:
+                            raise ValueError("Output buffer exceeds the memory budget")
+                        if used == capacity:
+                            flush({n: a[:used] for n, a in buffers.items()})
+                            buffers = {}
+                            used = 0
+                            buffered_bytes = 0
+                    offset += take
+        if used:
+            flush({n: a[:used] for n, a in buffers.items()})
+        if start != partition.stop:
+            raise ValueError("Source record count changed since discovery")
+        self.peak_buffer_bytes = peak_buffer_bytes
+        logger.info(
+            "Batch partition %s start=%s rows=%s batch_rows=%s buffer_rows=%s "
+            "chunk_rows=%s peak_batch_bytes=%s peak_buffer_bytes=%s budget=%s",
+            partition_index,
+            partition.start,
+            partition.stop - partition.start,
+            batch_rows,
+            buffer_rows,
+            chunk_rows,
+            self.source.peak_batch_bytes,
+            peak_buffer_bytes,
+            self.memory_budget,
+        )
 
     def open_partition_array(self, partition_index, name):
         field_map = self.schema.field_map()
