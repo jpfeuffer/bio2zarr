@@ -107,12 +107,19 @@ write Zarr without storing ICF columns. Input files must remain unchanged
 between passes. `--ploidy` pads genotypes to the supplied size, skips genotype
 discovery, and rejects genotypes exceeding that size.
 
-Discovery and encoding use `--worker-processes`, but reading the second pass
-is sequential. Unindexed files are scanned serially per file. For large indexed
-inputs, the default ICF workflow may be faster. Oversized chunks, invalid allele
-indices, and values exceeding discovered widths or dtypes raise errors rather
-than being truncated. If a chunk exceeds the memory budget, reduce
-`--variants-chunk-size` or use the default ICF workflow.
+Discovery uses `--worker-processes` for indexed regions and byte ranges of
+local uncompressed VCF files. Each plain-VCF scan worker uses an additional
+bounded feeder process to supply its header and byte range to the native parser;
+no index or temporary input copy is needed. Unindexed gzip inputs (including
+BGZF without an index) remain serial per file and produce a warning when worker
+processes are requested. Use plain VCF or indexed BGZF for parallel discovery.
+When progress is enabled, discovery counts records incrementally, with an
+indexed total where available and an indeterminate counter otherwise. Encoding
+uses `--worker-processes`, but reading the second pass is sequential. For large
+indexed inputs, the default ICF workflow may be faster. Oversized chunks,
+invalid allele indices, and values exceeding discovered widths or dtypes raise
+errors rather than being truncated. If a chunk exceeds the memory budget,
+reduce `--variants-chunk-size` or use the default ICF workflow.
 
 ## Local alleles
 

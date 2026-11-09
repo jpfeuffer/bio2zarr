@@ -4,12 +4,15 @@ import dataclasses
 import json
 import logging
 import math
+import multiprocessing
+import os
 import pathlib
 import pickle
 import re
 import shutil
 import sys
 import tempfile
+import time
 from functools import lru_cache, partial
 from typing import Any
 
@@ -1322,7 +1325,62 @@ def value_nbytes(value):
     return size
 
 
-def summarise_vcf_variants(variants, metadata, ploidy):
+def feed_vcf_byte_range(connection, path, header, start, stop):
+    try:
+        with connection, open(path, "rb") as source:
+            with os.fdopen(os.dup(connection.fileno()), "wb") as target:
+                target.write(header)
+                if start:
+                    source.seek(start - 1)
+                    if source.read(1) != b"\n":
+                        source.readline()
+                while source.tell() < stop:
+                    line = source.readline()
+                    if not line:
+                        break
+                    if not line.startswith(b"#"):
+                        target.write(line)
+    except BrokenPipeError:
+        # A failed or cancelled parser closes its input before the feeder finishes.
+        return
+
+
+@core.requires_optional_dependency("cyvcf2", "vcf")
+def iter_vcf_byte_range(path, start, stop):
+    """Parse records whose first byte belongs to [start, stop), without spooling."""
+    import cyvcf2  # noqa: PLC0415
+
+    with vcf_utils.VcfFile(path) as header:
+        header_bytes = header.vcf.raw_header.encode("utf-8")
+        contig = header.sequence_names[0]
+    ctx = multiprocessing.get_context("spawn")
+    read_end, write_end = ctx.Pipe(duplex=False)
+    # cyvcf2 can block holding the GIL, so a thread cannot safely feed its pipe.
+    producer = ctx.Process(
+        target=feed_vcf_byte_range,
+        args=(write_end, path, header_bytes, start, stop),
+    )
+    producer.start()
+    write_end.close()
+    try:
+        with read_end, os.fdopen(os.dup(read_end.fileno()), "rb") as source:
+            parser = cyvcf2.VCF(source)
+            try:
+                for variant in parser:
+                    if variant.CHROM != contig:
+                        raise ValueError("Multi-contig VCFs must be indexed")
+                    yield variant
+            finally:
+                parser.close()
+    finally:
+        producer.join()
+    if producer.exitcode != 0:
+        raise RuntimeError(
+            f"VCF byte-range feeder failed with exit code {producer.exitcode}"
+        )
+
+
+def summarise_vcf_variants(variants, metadata, ploidy, show_progress=False):
     """Reduce one owned input region without retaining its rows."""
     fields = [
         dataclasses.replace(field, summary=VcfFieldSummary())
@@ -1334,6 +1392,8 @@ def summarise_vcf_variants(variants, metadata, ploidy):
     }
     count = 0
     last_position = None
+    pending_progress = 0
+    last_progress = time.monotonic() if show_progress else None
     for variant in variants:
         values = variant_values(variant, metadata, genotypes=ploidy is None)
         row_bytes = sum(value_nbytes(value) for value in values.values())
@@ -1349,7 +1409,15 @@ def summarise_vcf_variants(variants, metadata, ploidy):
                 )
         count += 1
         last_position = variant.POS
-        core.update_progress(1)
+        if show_progress:
+            pending_progress += 1
+            now = time.monotonic()
+            if pending_progress >= 1024 or now - last_progress >= 0.1:
+                core.update_progress(pending_progress)
+                pending_progress = 0
+                last_progress = now
+    if pending_progress:
+        core.update_progress(pending_progress)
     return IcfPartitionMetadata(
         num_records=count,
         last_position=last_position,
@@ -1357,11 +1425,25 @@ def summarise_vcf_variants(variants, metadata, ploidy):
     )
 
 
-def discover_vcf_partition(metadata, partition_index, ploidy):
+def discover_vcf_partition(
+    metadata, partition_index, ploidy, byte_range=None, show_progress=False
+):
     partition = metadata.partitions[partition_index]
+    if byte_range is not None:
+        variants = iter_vcf_byte_range(partition.vcf_path, *byte_range)
+        with contextlib.closing(variants):
+            return (
+                partition_index,
+                byte_range,
+                summarise_vcf_variants(variants, metadata, ploidy, show_progress),
+            )
     with vcf_utils.VcfFile(partition.vcf_path) as file:
-        return partition_index, summarise_vcf_variants(
-            file.variants(partition.region), metadata, ploidy
+        return (
+            partition_index,
+            byte_range,
+            summarise_vcf_variants(
+                file.variants(partition.region), metadata, ploidy, show_progress
+            ),
         )
 
 
@@ -1371,21 +1453,65 @@ def discover_vcf_shape(vcfs, *, ploidy=None, worker_processes=0, show_progress=F
     )
     check_field_clobbering(metadata)
     expected_records = metadata.num_records
+    jobs = []
+    for index, partition in enumerate(metadata.partitions):
+        byte_ranges = [None]
+        with vcf_utils.VcfFile(partition.vcf_path) as file:
+            if worker_processes > 0 and file.index is None:
+                path = pathlib.Path(partition.vcf_path)
+                with path.open("rb") as source:
+                    magic = source.read(2)
+                if magic == b"##":
+                    size = path.stat().st_size
+                    boundaries = [
+                        size * j // worker_processes
+                        for j in range(worker_processes + 1)
+                    ]
+                    byte_ranges = [
+                        (start, stop)
+                        for start, stop in zip(boundaries[:-1], boundaries[1:])
+                        if start < stop
+                    ]
+                else:
+                    logger.warning(
+                        "Unindexed %s input %s: shape discovery will be serial; "
+                        "use plain VCF or indexed BGZF for parallel discovery.",
+                        "gzip VCF" if magic == b"\x1f\x8b" else "VCF/BCF",
+                        path,
+                    )
+        jobs.extend((index, byte_range) for byte_range in byte_ranges)
+    for partition in metadata.partitions:
+        partition.num_records = 0
+        partition.region.end = None
     progress = core.ProgressConfig(
         total=expected_records if np.isfinite(expected_records) else None,
-        units="vars",
+        units="records",
         title="Discover",
         show=show_progress,
     )
     with core.ParallelWorkManager(worker_processes, progress) as pwm:
-        for index in range(len(metadata.partitions)):
-            pwm.submit(discover_vcf_partition, metadata, index, ploidy)
+        for index, byte_range in jobs:
+            pwm.submit(
+                discover_vcf_partition,
+                metadata,
+                index,
+                ploidy,
+                byte_range,
+                show_progress,
+            )
         summaries = list(pwm.results_as_completed())
     total = 0
-    for index, summary in summaries:
+    last_byte_offset = {}
+    for index, byte_range, summary in summaries:
         partition = metadata.partitions[index]
-        partition.num_records = summary.num_records
-        partition.region.end = summary.last_position
+        partition.num_records += summary.num_records
+        if byte_range is None and summary.last_position is not None:
+            partition.region.end = summary.last_position
+        elif summary.last_position is not None and byte_range[
+            0
+        ] >= last_byte_offset.get(index, -1):
+            partition.region.end = summary.last_position
+            last_byte_offset[index] = byte_range[0]
         total += summary.num_records
         for field in metadata.fields:
             field.summary.update(summary.field_summaries[field.full_name])
