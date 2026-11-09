@@ -120,9 +120,9 @@ Install `bio2zarr[vcf,s3]` to use `s3://bucket/key` VCF/BCF input and
 `s3://bucket/prefix` ICF and final Zarr storage (formats 2 and 3):
 
 ```bash
-vcf2zarr convert s3://my-bucket/input/sample.vcf.gz s3://my-bucket/output/sample.vcz --max-ploidy 2
+vcf2zarr convert s3://my-bucket/input/sample.vcf.gz s3://my-bucket/output/sample.vcz --infer-shape --ploidy 2
 vcf2zarr explode s3://my-bucket/input/sample.vcf.gz s3://my-bucket/work/sample.icf
-vcf2zarr encode s3://my-bucket/work/sample.icf s3://my-bucket/output/sample.vcz --batch-size 64
+vcf2zarr encode s3://my-bucket/work/sample.icf s3://my-bucket/output/sample.vcz
 vcf2zarr convert sample.vcf.gz sample.vcz --temp-icf-dir s3://my-bucket/tmp
 ```
 
@@ -175,7 +175,11 @@ removing `wip`. Publication is this metadata-only completion step, not a
 directory rename or a copy of the dataset. Bio2zarr reopening/inspection
 rejects remote destinations that still contain `wip`. Do not read a destination
 while conversion/finalisation is running; an interrupted finalisation can be
-retried with `dencode-finalise`. Concurrent writers to the same partition or
+retried with `vcf2zarr dencode-finalise OUTPUT`, including no-ICF output once
+every partition completed. This recovery reads output metadata only and does
+not require the original input. `dencode-partition` requires ICF and cannot
+reconstruct a failed no-ICF chunk; restart no-ICF conversion with `--force` to
+replace that incomplete output. Concurrent writers to the same partition or
 destination are not supported. Use distinct empty prefixes for independent jobs.
 Cleanup targets only exact descendant keys, never neighbouring prefixes or
 buckets. `--force` removes existing data only within the requested prefix.
@@ -252,7 +256,8 @@ AWS_SECRET_ACCESS_KEY=bio2zarr-local-test \
 AWS_DEFAULT_REGION=us-east-1 \
 BIO2ZARR_MINIO_ENDPOINT=http://127.0.0.1:PORT \
 uv run pytest tests/test_s3_storage.py --no-cov
-docker rm -f bio2zarr-minio-test
+docker stop bio2zarr-minio-test
+docker rm -v bio2zarr-minio-test
 ```
 
 These credentials are disposable test credentials only, never production

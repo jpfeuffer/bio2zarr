@@ -31,6 +31,18 @@ and rejects larger ploidies. Invalid allele indices and field overflows raise
 `ValueError`. Oversized chunks require a smaller `variants_chunk_size` or the
 default ICF conversion. `infer_shape` cannot be combined with `icf_path`.
 
+For S3 input/output and temporary ICF placement in the default conversion:
+```python
+root = v2z.convert(
+    ["s3://my-bucket/input/sample.vcf.gz"],
+    "s3://my-bucket/output/sample.vcz",
+    temp_icf_dir="s3://my-bucket/tmp",
+)
+```
+
+See the overview for credentials and endpoint configuration. `temp_icf_dir`
+and `icf_path` are mutually exclusive and cannot be used with `infer_shape`.
+
 ## API reference
 
 ```{eval-rst}

@@ -588,6 +588,11 @@ def convert_vcf(
         raise click.UsageError("No-ICF conversion cannot specify ICF storage")
     if icf_path is not None and temp_icf_dir is not None:
         raise click.UsageError("--icf-path and --temp-icf-dir are mutually exclusive")
+    storage_options = {}
+    if icf_path is not None:
+        storage_options["icf_path"] = icf_path
+    if temp_icf_dir is not None:
+        storage_options["temp_icf_dir"] = temp_icf_dir
     check_overwrite_dir(zarr_path, force)
     vcf_mod.convert(
         vcfs,
@@ -600,8 +605,7 @@ def convert_vcf(
         ploidy=ploidy,
         zarr_format=zarr_format,
         infer_shape=infer_shape,
-        icf_path=icf_path,
-        temp_icf_dir=temp_icf_dir,
+        **storage_options,
     )
 
 

@@ -7,7 +7,6 @@ import math
 import pathlib
 import pickle
 import re
-import shutil
 import sys
 import tempfile
 import uuid
@@ -2038,7 +2037,9 @@ def convert(
         raise ValueError("icf_path and temp_icf_dir are mutually exclusive")
     if infer_shape:
         if icf_path is not None or temp_icf_dir is not None:
-            raise ValueError("No-ICF conversion cannot specify ICF storage")
+            raise ValueError(
+                "No-ICF conversion cannot specify icf_path or temp_icf_dir"
+            )
         vcfs = list(vcfs)
         metadata, header = discover_vcf_shape(
             vcfs,

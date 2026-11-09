@@ -876,10 +876,11 @@ class VcfZarrWriter:
     # encode_partition
     #######################
 
-    def load_metadata(self):
+    def load_metadata(self, *, load_source=True):
         if self.metadata is None:
             with (self.wip_path / "metadata.json").open() as f:
                 self.metadata = VcfZarrWriterMetadata.fromdict(json.load(f))
+        if load_source and self.source is None:
             self.source = self.source_type(self.metadata.source_path)
         if self.zarr_format is None:
             self.zarr_format = zarr.open_group(
@@ -1161,7 +1162,7 @@ class VcfZarrWriter:
         core.update_progress(1)
 
     def finalise(self, show_progress=False):
-        self.load_metadata()
+        self.load_metadata(load_source=not isinstance(self.path, storage.S3Path))
 
         logger.info(f"Scanning {self.num_partitions} partitions")
         missing = []

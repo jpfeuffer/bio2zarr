@@ -13,7 +13,7 @@ from upath import UPath
 
 from bio2zarr import cli, storage, vcf_utils
 from bio2zarr import vcf as vcf_mod
-from tests.test_vcf_streaming import assert_zarr_equal
+from tests.utils import assert_zarr_equal
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32", reason="VCF support requires cyvcf2"
@@ -103,285 +103,354 @@ def drain_requests(request_queue):
             return requests
 
 
-@pytest.mark.parametrize(
-    "filename",
-    ["sample.vcf.gz", "sample.bcf", "empty.vcf.gz", "sample_extra_contig.vcf.gz"],
-)
-def test_s3_input(s3, filename):
-    uri = upload(s3, filename)
-    expected = vcf_mod.convert([DATA / filename], infer_shape=True)
-    actual = vcf_mod.convert([uri], infer_shape=True)
-    assert_zarr_equal(expected, actual)
-    _, request_queue = s3
-    requests = drain_requests(request_queue)
-    assert any(name == f"/bio2zarr-test/input/{filename}" for name, *_ in requests)
-    assert all(
-        "Signature" not in query and "X-Amz" not in query
-        for _, _, query, _, _ in requests
-    )
-    assert any(
-        name == f"/bio2zarr-test/input/{filename}" and auth
-        for name, _, _, auth, _ in requests
-    )
-
-
-@pytest.mark.parametrize(
-    ("filename", "index_suffix"),
-    [
-        ("sample.vcf.gz", ".tbi"),
-        ("sample_extra_contig.vcf.gz", ".csi"),
-        ("sample.bcf", ".csi"),
-    ],
-)
-def test_s3_custom_index_isolation(s3, filename, index_suffix):
-    client, request_queue = s3
-    uri = upload(s3, filename)
-    index = pathlib.Path(str(DATA / filename) + index_suffix)
-    for prefix in ["one", "two"]:
-        client.upload_file(
-            str(index), "bio2zarr-test", f"{prefix}/shared{index_suffix}"
+class TestStorageValidation:
+    def test_s3_zip_rejected_before_overwrite(self, monkeypatch):
+        monkeypatch.setattr(
+            cli, "check_overwrite_dir", lambda *args: pytest.fail("overwrite attempted")
         )
-    client.delete_object(Bucket="bio2zarr-test", Key=f"input/{filename}{index_suffix}")
-    with (
-        vcf_utils.VcfFile(
-            uri, index_path=f"s3+http://bio2zarr-test/one/shared{index_suffix}"
-        ) as first,
-        vcf_utils.VcfFile(
-            uri, index_path=f"s3+http://bio2zarr-test/two/shared{index_suffix}"
-        ) as second,
-    ):
-        expected = [(v.CHROM, v.POS) for v in first.vcf]
-        assert expected == [(v.CHROM, v.POS) for v in second.vcf]
-        region = vcf_utils.Region(expected[0][0], expected[0][1], expected[0][1])
-        assert first.count_variants(region) == second.count_variants(region) == 1
-        if filename.endswith(".bcf"):
-            assert first._temporary_index is second._temporary_index is None
-        else:
-            assert first._temporary_index.name != second._temporary_index.name
-            temp_paths = [first._temporary_index.name, second._temporary_index.name]
-            assert all(pathlib.Path(p, "index.tbi").exists() for p in temp_paths)
-    if not filename.endswith(".bcf"):
-        assert all(not pathlib.Path(p).exists() for p in temp_paths)
-    requests = drain_requests(request_queue)
-    if filename.endswith(".bcf"):
-        # BCF index reads use HTSlib, not the s3fs statistics reader alone.
+        result = click.testing.CliRunner().invoke(
+            cli.vcf2zarr_main,
+            [
+                "convert",
+                str(DATA / "sample.vcf.gz"),
+                "s3://bucket/existing.zip",
+                "--infer-shape",
+                "--force",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "ZIP output must be a local path" in result.output
+        with pytest.raises(ValueError, match="ZIP output must be a local path"):
+            vcf_mod.convert(
+                [DATA / "sample.vcf.gz"], "s3://bucket/existing.zip", infer_shape=True
+            )
+
+    @pytest.mark.parametrize("option", ["--icf-path", "--temp-icf-dir"])
+    def test_no_icf_rejects_storage_before_overwrite(self, monkeypatch, option):
+        monkeypatch.setattr(
+            cli, "check_overwrite_dir", lambda *args: pytest.fail("overwrite attempted")
+        )
+        result = click.testing.CliRunner().invoke(
+            cli.vcf2zarr_main,
+            [
+                "convert",
+                str(DATA / "sample.vcf.gz"),
+                "s3://bucket/existing",
+                "--infer-shape",
+                option,
+                "s3://bucket/intermediate",
+                "--force",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "No-ICF conversion cannot specify ICF storage" in result.output
+
+    def test_mutually_exclusive_storage_before_overwrite(self, monkeypatch):
+        monkeypatch.setattr(
+            cli, "check_overwrite_dir", lambda *args: pytest.fail("overwrite attempted")
+        )
+        result = click.testing.CliRunner().invoke(
+            cli.vcf2zarr_main,
+            [
+                "convert",
+                str(DATA / "sample.vcf.gz"),
+                "s3://bucket/existing",
+                "--icf-path",
+                "s3://bucket/intermediate",
+                "--temp-icf-dir",
+                "s3://bucket/tmp",
+                "--force",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "--icf-path and --temp-icf-dir are mutually exclusive" in result.output
+
+
+class TestS3Storage:
+    @pytest.mark.parametrize(
+        "filename",
+        ["sample.vcf.gz", "sample.bcf", "empty.vcf.gz", "sample_extra_contig.vcf.gz"],
+    )
+    def test_s3_input(self, s3, filename):
+        uri = upload(s3, filename)
+        expected = vcf_mod.convert([DATA / filename], infer_shape=True)
+        actual = vcf_mod.convert([uri], infer_shape=True)
+        assert_zarr_equal(expected, actual)
+        _, request_queue = s3
+        requests = drain_requests(request_queue)
+        assert any(name == f"/bio2zarr-test/input/{filename}" for name, *_ in requests)
+        assert all(
+            "Signature" not in query and "X-Amz" not in query
+            for _, _, query, _, _ in requests
+        )
         assert any(
-            name == f"/bio2zarr-test/one/shared{index_suffix}"
-            and auth
+            name == f"/bio2zarr-test/input/{filename}" and auth
+            for name, _, _, auth, _ in requests
+        )
+
+    @pytest.mark.parametrize(
+        ("filename", "index_suffix"),
+        [
+            ("sample.vcf.gz", ".tbi"),
+            ("sample_extra_contig.vcf.gz", ".csi"),
+            ("sample.bcf", ".csi"),
+        ],
+    )
+    def test_s3_custom_index_isolation(self, s3, filename, index_suffix):
+        client, request_queue = s3
+        uri = upload(s3, filename)
+        index = pathlib.Path(str(DATA / filename) + index_suffix)
+        for prefix in ["one", "two"]:
+            client.upload_file(
+                str(index), "bio2zarr-test", f"{prefix}/shared{index_suffix}"
+            )
+        client.delete_object(
+            Bucket="bio2zarr-test", Key=f"input/{filename}{index_suffix}"
+        )
+        with (
+            vcf_utils.VcfFile(
+                uri, index_path=f"s3+http://bio2zarr-test/one/shared{index_suffix}"
+            ) as first,
+            vcf_utils.VcfFile(
+                uri, index_path=f"s3+http://bio2zarr-test/two/shared{index_suffix}"
+            ) as second,
+        ):
+            expected = [(v.CHROM, v.POS) for v in first.vcf]
+            assert expected == [(v.CHROM, v.POS) for v in second.vcf]
+            region = vcf_utils.Region(expected[0][0], expected[0][1], expected[0][1])
+            assert first.count_variants(region) == second.count_variants(region) == 1
+            if filename.endswith(".bcf"):
+                assert first._temporary_index is second._temporary_index is None
+            else:
+                assert first._temporary_index.name != second._temporary_index.name
+                temp_paths = [first._temporary_index.name, second._temporary_index.name]
+                assert all(pathlib.Path(p, "index.tbi").exists() for p in temp_paths)
+        if not filename.endswith(".bcf"):
+            assert all(not pathlib.Path(p).exists() for p in temp_paths)
+        requests = drain_requests(request_queue)
+        if filename.endswith(".bcf"):
+            # BCF index reads use HTSlib, not the s3fs statistics reader alone.
+            assert any(
+                name == f"/bio2zarr-test/one/shared{index_suffix}"
+                and auth
+                and "htslib" in agent.lower()
+                for name, _, _, auth, agent in requests
+            )
+        assert all(
+            "Signature" not in query and "X-Amz" not in query
+            for _, _, query, _, _ in requests
+        )
+
+    def test_s3_variant_range_read(self, s3, tmp_path):
+        source = tmp_path / "large.vcf"
+        rng = random.Random(42)
+        with source.open("w") as file:
+            file.write(
+                "##fileformat=VCFv4.3\n##contig=<ID=1>\n"
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+            )
+            for j in range(10000):
+                alt = "".join(rng.choices("ACGT", k=128))
+                file.write(f"1\t{j * 1000 + 1}\t.\tA\t{alt}\t.\t.\t.\n")
+        compressed = str(source) + ".gz"
+        pysam.tabix_compress(str(source), compressed)
+        pysam.tabix_index(compressed, preset="vcf")
+        assert pathlib.Path(compressed).stat().st_size > 65536
+        client, request_queue = s3
+        for suffix in ["", ".tbi"]:
+            client.upload_file(
+                compressed + suffix, "bio2zarr-test", "input/large.vcf.gz" + suffix
+            )
+        with vcf_utils.VcfFile("s3+http://bio2zarr-test/input/large.vcf.gz") as file:
+            assert file.count_variants(vcf_utils.Region("1", 9999001, 9999001)) == 1
+        requests = drain_requests(request_queue)
+        assert any(
+            name == "/bio2zarr-test/input/large.vcf.gz"
+            and byte_range
+            and int(byte_range.removeprefix("bytes=").split("-")[0]) > 65536
             and "htslib" in agent.lower()
-            for name, _, _, auth, agent in requests
+            for name, byte_range, _, _, agent in requests
         )
-    assert all(
-        "Signature" not in query and "X-Amz" not in query
-        for _, _, query, _, _ in requests
-    )
 
-
-def test_s3_variant_range_read(s3, tmp_path):
-    source = tmp_path / "large.vcf"
-    rng = random.Random(42)
-    with source.open("w") as file:
-        file.write(
-            "##fileformat=VCFv4.3\n##contig=<ID=1>\n"
-            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
-        )
-        for j in range(10000):
-            alt = "".join(rng.choices("ACGT", k=128))
-            file.write(f"1\t{j * 1000 + 1}\t.\tA\t{alt}\t.\t.\t.\n")
-    compressed = str(source) + ".gz"
-    pysam.tabix_compress(str(source), compressed)
-    pysam.tabix_index(compressed, preset="vcf")
-    assert pathlib.Path(compressed).stat().st_size > 65536
-    client, request_queue = s3
-    for suffix in ["", ".tbi"]:
-        client.upload_file(
-            compressed + suffix, "bio2zarr-test", "input/large.vcf.gz" + suffix
-        )
-    with vcf_utils.VcfFile("s3+http://bio2zarr-test/input/large.vcf.gz") as file:
-        assert file.count_variants(vcf_utils.Region("1", 9999001, 9999001)) == 1
-    requests = drain_requests(request_queue)
-    assert any(
-        name == "/bio2zarr-test/input/large.vcf.gz"
-        and byte_range
-        and int(byte_range.removeprefix("bytes=").split("-")[0]) > 65536
-        and "htslib" in agent.lower()
-        for name, byte_range, _, _, agent in requests
-    )
-
-
-def test_s3_icf_lifecycle(s3, tmp_path):
-    uri = upload(s3, "sample.vcf.gz")
-    icf_path = "s3://bio2zarr-test/intermediate/run"
-    summary = vcf_mod.explode_init(icf_path, [uri], target_num_partitions=3)
-    with pytest.raises(FileNotFoundError, match="Partition metadata not found"):
+    def test_s3_icf_lifecycle(self, s3, tmp_path):
+        uri = upload(s3, "sample.vcf.gz")
+        icf_path = "s3://bio2zarr-test/intermediate/run"
+        summary = vcf_mod.explode_init(icf_path, [uri], target_num_partitions=3)
+        with pytest.raises(FileNotFoundError, match="Partition metadata not found"):
+            vcf_mod.explode_finalise(icf_path)
+        for j in range(summary.num_partitions):
+            vcf_mod.explode_partition(icf_path, j)
+        vcf_mod.explode_partition(icf_path, 0)
         vcf_mod.explode_finalise(icf_path)
-    for j in range(summary.num_partitions):
-        vcf_mod.explode_partition(icf_path, j)
-    vcf_mod.explode_partition(icf_path, 0)
-    vcf_mod.explode_finalise(icf_path)
-    assert not storage.path(icf_path + "/wip").exists()
-    icf = vcf_mod.IntermediateColumnarFormat(icf_path)
-    assert icf.num_records == 9
-    assert vcf_mod.inspect(icf_path) == icf.summary_table()
-    expected = vcf_mod.convert([DATA / "sample.vcf.gz"])
-    out = tmp_path / "vcz"
-    summary = vcf_mod.encode_init(icf_path, out, 3, batch_size=2, variants_chunk_size=3)
-    for j in range(summary.num_partitions):
-        vcf_mod.encode_partition(out, j)
-    vcf_mod.encode_finalise(out)
-    vcf_mod.create_index(out)
-    same_chunks = vcf_mod.encode(icf_path, variants_chunk_size=3, batch_size=2)
-    assert_zarr_equal(same_chunks, vcf_mod.zarr_utils.open_vcf_zarr(out))
-    assert_zarr_equal(expected, vcf_mod.encode(icf_path, batch_size=2))
-    metadata = json.loads(storage.path(icf_path + "/metadata.json").open().read())
-    assert metadata["partitions"][0]["vcf_path"] == uri
-    assert "testing" not in json.dumps(metadata)
-    assert "X-Amz" not in json.dumps(metadata)
+        assert not storage.path(icf_path + "/wip").exists()
+        icf = vcf_mod.IntermediateColumnarFormat(icf_path)
+        assert icf.num_records == 9
+        assert vcf_mod.inspect(icf_path) == icf.summary_table()
+        expected = vcf_mod.convert([DATA / "sample.vcf.gz"])
+        out = tmp_path / "vcz"
+        summary = vcf_mod.encode_init(icf_path, out, 3, variants_chunk_size=3)
+        for j in range(summary.num_partitions):
+            vcf_mod.encode_partition(out, j)
+        vcf_mod.encode_finalise(out)
+        vcf_mod.create_index(out)
+        same_chunks = vcf_mod.encode(icf_path, variants_chunk_size=3)
+        assert_zarr_equal(same_chunks, vcf_mod.zarr_utils.open_vcf_zarr(out))
+        assert_zarr_equal(expected, vcf_mod.encode(icf_path))
+        metadata = json.loads(storage.path(icf_path + "/metadata.json").open().read())
+        assert metadata["partitions"][0]["vcf_path"] == uri
+        assert "testing" not in json.dumps(metadata)
+        assert "X-Amz" not in json.dumps(metadata)
 
+    def test_temporary_s3_icf_cleanup(self, s3):
+        client, _ = s3
+        neighbour = "temp/not-our-run"
+        client.put_object(Bucket="bio2zarr-test", Key=neighbour, Body=b"keep")
+        expected = vcf_mod.convert([DATA / "sample.vcf.gz"])
+        actual = vcf_mod.convert(
+            [DATA / "sample.vcf.gz"],
+            temp_icf_dir="s3://bio2zarr-test/temp",
+        )
+        assert_zarr_equal(expected, actual)
+        objects = client.list_objects_v2(Bucket="bio2zarr-test", Prefix="temp/")
+        assert [o["Key"] for o in objects["Contents"]] == [neighbour]
 
-def test_temporary_s3_icf_cleanup(s3):
-    client, _ = s3
-    neighbour = "temp/not-our-run"
-    client.put_object(Bucket="bio2zarr-test", Key=neighbour, Body=b"keep")
-    expected = vcf_mod.convert([DATA / "sample.vcf.gz"])
-    actual = vcf_mod.convert(
-        [DATA / "sample.vcf.gz"],
-        temp_icf_dir="s3://bio2zarr-test/temp",
+        def fail_after_writing():
+            with vcf_mod.temp_icf_path(dir="s3://bio2zarr-test/temp") as tmp:
+                with (tmp / "written").open("wb") as file:
+                    file.write(b"data")
+                raise RuntimeError("failed")
+
+        with pytest.raises(RuntimeError, match="failed"):
+            fail_after_writing()
+        objects = client.list_objects_v2(Bucket="bio2zarr-test", Prefix="temp/")
+        assert [o["Key"] for o in objects["Contents"]] == [neighbour]
+
+    def test_s3_index_errors(self, s3):
+        uri = upload(s3, "sample.vcf.gz")
+        with pytest.raises(FileNotFoundError, match="Specified index path"):
+            vcf_utils.VcfFile(uri, index_path=uri + ".missing.csi")
+        with pytest.raises(FileNotFoundError):
+            vcf_utils.VcfFile(uri + ".absent")
+        s3[0].delete_object(Bucket="bio2zarr-test", Key="input/sample.vcf.gz.tbi")
+        with vcf_utils.VcfFile(uri) as file:
+            with pytest.raises(ValueError, match="Multi-contig VCFs must be indexed"):
+                list(file.variants())
+
+    def test_s3_native_error_propagates(self, s3, monkeypatch):
+        import cyvcf2  # noqa: PLC0415
+
+        uri = upload(s3, "sample.vcf.gz")
+
+        def unsupported(path):
+            assert path == uri
+            raise OSError("native S3 protocol unsupported")
+
+        monkeypatch.setattr(cyvcf2, "VCF", unsupported)
+        with pytest.raises(OSError, match="native S3 protocol unsupported"):
+            vcf_utils.VcfFile(uri)
+
+    def test_s3_cli(self, s3, tmp_path):
+        uri = upload(s3, "sample.vcf.gz")
+        result = click.testing.CliRunner().invoke(
+            cli.vcf2zarr_main,
+            [
+                "convert",
+                uri,
+                str(tmp_path / "out"),
+                "--infer-shape",
+                "--ploidy",
+                "2",
+                "-Q",
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+
+    @pytest.mark.parametrize("filename", ["sample.vcf.gz", "sample.bcf"])
+    def test_s3_worker_processes(self, s3, filename):
+        uri = upload(s3, filename)
+        actual = vcf_mod.convert(
+            [uri], infer_shape=True, ploidy=2, worker_processes=2, variants_chunk_size=3
+        )
+        expected = vcf_mod.convert(
+            [DATA / filename], infer_shape=True, ploidy=2, variants_chunk_size=3
+        )
+        assert_zarr_equal(expected, actual)
+
+    def test_s3_prefix_validation(
+        self,
+    ):
+        with pytest.raises(ValueError, match="bucket and an object"):
+            storage.path("s3://bucket")
+        with pytest.raises(ValueError, match="Unsupported storage protocol"):
+            storage.path("gs://bucket/input")
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("local/input.vcf.gz", "file"),
+            (pathlib.Path("local/input.vcf.gz"), "file"),
+            ("s3://bucket/input.vcf.gz", storage.S3_PROTOCOL),
+            (UPath("s3://bucket/input.vcf.gz"), storage.S3_PROTOCOL),
+            ("s3+http://bucket/input.vcf.gz", "s3+http"),
+            ("s3+https://bucket/input.vcf.gz", "s3+https"),
+            ("gs://bucket/input.vcf.gz", "gs"),
+        ],
     )
-    assert_zarr_equal(expected, actual)
-    objects = client.list_objects_v2(Bucket="bio2zarr-test", Prefix="temp/")
-    assert [o["Key"] for o in objects["Contents"]] == [neighbour]
+    def test_storage_protocol(self, value, expected):
+        assert storage.protocol(value) == expected
 
-    def fail_after_writing():
-        with vcf_mod.temp_icf_path(dir="s3://bio2zarr-test/temp") as tmp:
-            with (tmp / "written").open("wb") as file:
-                file.write(b"data")
-            raise RuntimeError("failed")
+    @pytest.mark.parametrize("scheme", ["s3", "gs", "az"])
+    def test_overwrite_remote_storage_is_protocol_independent(
+        self, monkeypatch, scheme
+    ):
+        remote = UPath(f"{scheme}://bucket/output")
+        monkeypatch.setattr(type(remote), "exists", lambda self: True)
+        removed = []
+        monkeypatch.setattr(storage, "remove_tree", removed.append)
+        cli.check_overwrite_dir(remote, force=True)
+        assert removed == [remote]
 
-    with pytest.raises(RuntimeError, match="failed"):
-        fail_after_writing()
-    objects = client.list_objects_v2(Bucket="bio2zarr-test", Prefix="temp/")
-    assert [o["Key"] for o in objects["Contents"]] == [neighbour]
+    @pytest.mark.parametrize("scheme", ["s3", "gs", "az"])
+    def test_zip_command_rejects_remote_destination_before_overwrite(
+        self, monkeypatch, tmp_path, scheme
+    ):
+        source = tmp_path / "source"
+        source.mkdir()
+        monkeypatch.setattr(
+            cli, "check_overwrite_dir", lambda *args: pytest.fail("overwrite attempted")
+        )
+        result = click.testing.CliRunner().invoke(
+            cli.zipzarr, [str(source), f"{scheme}://bucket/output", "--keep"]
+        )
+        assert result.exit_code == 2
+        assert "ZIP input/output must be local paths" in result.output
 
+    @pytest.mark.parametrize("scheme", ["s3", "s3+http", "s3+https"])
+    def test_universal_pathlib(self, scheme, monkeypatch):
+        monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+        monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
+        monkeypatch.delenv("HTS_S3_HOST", raising=False)
+        uri = f"{scheme}://bucket/input.vcf.gz"
+        path = vcf_utils.input_path(uri)
+        assert isinstance(path, UPath)
+        assert storage.path(path) is path
+        assert str(path) == "s3://bucket/input.vcf.gz"
+        index = path.with_suffix(".gz.tbi")
+        assert str(index) == "s3://bucket/input.vcf.gz.tbi"
+        assert index.storage_options == path.storage_options
+        if scheme != "s3":
+            transport = scheme.split("+")[1]
+            assert (
+                path.storage_options["endpoint_url"]
+                == f"{transport}://s3.amazonaws.com"
+            )
+        assert isinstance(storage.path("local.vcf.gz"), pathlib.Path)
 
-def test_s3_index_errors(s3):
-    uri = upload(s3, "sample.vcf.gz")
-    with pytest.raises(FileNotFoundError, match="Specified index path"):
-        vcf_utils.VcfFile(uri, index_path=uri + ".missing.csi")
-    with pytest.raises(FileNotFoundError):
-        vcf_utils.VcfFile(uri + ".absent")
-    s3[0].delete_object(Bucket="bio2zarr-test", Key="input/sample.vcf.gz.tbi")
-    with vcf_utils.VcfFile(uri) as file:
-        with pytest.raises(ValueError, match="Multi-contig VCFs must be indexed"):
-            list(file.variants())
-
-
-def test_s3_native_error_propagates(s3, monkeypatch):
-    import cyvcf2  # noqa: PLC0415
-
-    uri = upload(s3, "sample.vcf.gz")
-
-    def unsupported(path):
-        assert path == uri
-        raise OSError("native S3 protocol unsupported")
-
-    monkeypatch.setattr(cyvcf2, "VCF", unsupported)
-    with pytest.raises(OSError, match="native S3 protocol unsupported"):
-        vcf_utils.VcfFile(uri)
-
-
-def test_s3_cli(s3, tmp_path):
-    uri = upload(s3, "sample.vcf.gz")
-    result = click.testing.CliRunner().invoke(
-        cli.vcf2zarr_main,
-        ["convert", uri, str(tmp_path / "out"), "--max-ploidy", "2", "-Q"],
-        catch_exceptions=False,
-    )
-    assert result.exit_code == 0
-
-
-@pytest.mark.parametrize("filename", ["sample.vcf.gz", "sample.bcf"])
-def test_s3_worker_processes(s3, filename):
-    uri = upload(s3, filename)
-    actual = vcf_mod.convert(
-        [uri], max_ploidy=2, worker_processes=2, variants_chunk_size=3
-    )
-    expected = vcf_mod.convert([DATA / filename], max_ploidy=2, variants_chunk_size=3)
-    assert_zarr_equal(expected, actual)
-
-
-def test_s3_prefix_validation():
-    with pytest.raises(ValueError, match="bucket and an object"):
-        storage.path("s3://bucket")
-    with pytest.raises(ValueError, match="Unsupported storage protocol"):
-        storage.path("gs://bucket/input")
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("local/input.vcf.gz", "file"),
-        (pathlib.Path("local/input.vcf.gz"), "file"),
-        ("s3://bucket/input.vcf.gz", storage.S3_PROTOCOL),
-        (UPath("s3://bucket/input.vcf.gz"), storage.S3_PROTOCOL),
-        ("s3+http://bucket/input.vcf.gz", "s3+http"),
-        ("s3+https://bucket/input.vcf.gz", "s3+https"),
-        ("gs://bucket/input.vcf.gz", "gs"),
-    ],
-)
-def test_storage_protocol(value, expected):
-    assert storage.protocol(value) == expected
-
-
-@pytest.mark.parametrize("scheme", ["s3", "gs", "az"])
-def test_overwrite_remote_storage_is_protocol_independent(monkeypatch, scheme):
-    remote = UPath(f"{scheme}://bucket/output")
-    monkeypatch.setattr(type(remote), "exists", lambda self: True)
-    removed = []
-    monkeypatch.setattr(storage, "remove_tree", removed.append)
-    cli.check_overwrite_dir(remote, force=True)
-    assert removed == [remote]
-
-
-@pytest.mark.parametrize("scheme", ["s3", "gs", "az"])
-def test_zip_command_rejects_remote_destination_before_overwrite(
-    monkeypatch, tmp_path, scheme
-):
-    source = tmp_path / "source"
-    source.mkdir()
-    monkeypatch.setattr(
-        cli, "check_overwrite_dir", lambda *args: pytest.fail("overwrite attempted")
-    )
-    result = click.testing.CliRunner().invoke(
-        cli.zipzarr, [str(source), f"{scheme}://bucket/output", "--keep"]
-    )
-    assert result.exit_code == 2
-    assert "ZIP input/output must be local paths" in result.output
-
-
-@pytest.mark.parametrize("scheme", ["s3", "s3+http", "s3+https"])
-def test_universal_pathlib(scheme, monkeypatch):
-    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
-    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
-    monkeypatch.delenv("HTS_S3_HOST", raising=False)
-    uri = f"{scheme}://bucket/input.vcf.gz"
-    path = vcf_utils.input_path(uri)
-    assert isinstance(path, UPath)
-    assert storage.path(path) is path
-    assert str(path) == "s3://bucket/input.vcf.gz"
-    index = path.with_suffix(".gz.tbi")
-    assert str(index) == "s3://bucket/input.vcf.gz.tbi"
-    assert index.storage_options == path.storage_options
-    if scheme != "s3":
-        transport = scheme.split("+")[1]
-        assert path.storage_options["endpoint_url"] == f"{transport}://s3.amazonaws.com"
-    assert isinstance(storage.path("local.vcf.gz"), pathlib.Path)
-
-
-def test_mkdir_does_not_create_bucket(s3):
-    client, _ = s3
-    with pytest.raises(FileNotFoundError, match="S3 bucket does not exist"):
-        storage.mkdir(storage.path("s3://absent-bucket/intermediate"))
-    assert [bucket["Name"] for bucket in client.list_buckets()["Buckets"]] == [
-        "bio2zarr-test"
-    ]
+    def test_mkdir_does_not_create_bucket(self, s3):
+        client, _ = s3
+        with pytest.raises(FileNotFoundError, match="S3 bucket does not exist"):
+            storage.mkdir(storage.path("s3://absent-bucket/intermediate"))
+        assert [bucket["Name"] for bucket in client.list_buckets()["Buckets"]] == [
+            "bio2zarr-test"
+        ]
