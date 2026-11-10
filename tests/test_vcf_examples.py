@@ -297,7 +297,7 @@ class TestSmallExample:
             ("Float", "f4", [1.5, np.nan]),
         ],
     )
-    def test_encoding_transform_reuses_native_numeric_arrays(
+    def test_encoding_transform_copies_native_numeric_arrays(
         self, vcf_type, dtype, values
     ):
         field = vcf_mod.VcfField(
@@ -305,16 +305,12 @@ class TestSmallExample:
         )
         transformer = vcf_mod.VcfValueTransformer.factory(field, 2)
         native = np.array(values, dtype=dtype).reshape(2, 1)
+        transformed = transformer.transform(native)
 
-        assert transformer.transform_for_encoding(native) is native
-        nt.assert_equal(
-            transformer.transform_for_encoding(native), transformer.transform(native)
-        )
-
-        undershaped = native[:, 0]
-        transformed = transformer.transform_for_encoding(undershaped)
-        assert transformed is not undershaped
-        nt.assert_equal(transformed, transformer.transform(undershaped))
+        assert transformed is not native
+        nt.assert_equal(transformed, native)
+        native[0, 0] = 9
+        assert transformed[0, 0] != native[0, 0]
 
     @pytest.mark.parametrize(
         "array",

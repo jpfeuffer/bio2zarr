@@ -561,16 +561,6 @@ class VcfValueTransformer:
         value = np.array(vcf_value, ndmin=self.dimension, copy=True)
         return value
 
-    def transform_for_encoding(self, vcf_value):
-        """Avoid copying native numeric arrays consumed by the row sanitizer."""
-        if (
-            isinstance(vcf_value, np.ndarray)
-            and vcf_value.dtype.kind in "iuf"
-            and vcf_value.ndim >= self.dimension
-        ):
-            return vcf_value
-        return self.transform(vcf_value)
-
     def transform_and_update_bounds(self, vcf_value):
         if vcf_value is None:
             return None
@@ -1673,11 +1663,7 @@ class DirectVcfSource(VcfSource):
                 ):
                     raise ValueError("VCF row exceeds the no-ICF memory budget")
                 row = {
-                    name: (
-                        None
-                        if value is None
-                        else transformers[name].transform_for_encoding(value)
-                    )
+                    name: None if value is None else transformers[name].transform(value)
                     for name, value in values.items()
                 }
                 if (
