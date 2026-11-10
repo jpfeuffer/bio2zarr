@@ -291,6 +291,32 @@ class TestSmallExample:
         assert dtype_lookup.call_count == integer_fields * len(metadata.partitions)
 
     @pytest.mark.parametrize(
+        ("vcf_type", "dtype", "values"),
+        [
+            ("Integer", "i4", [1, 2]),
+            ("Float", "f4", [1.5, np.nan]),
+        ],
+    )
+    def test_encoding_transform_reuses_native_numeric_arrays(
+        self, vcf_type, dtype, values
+    ):
+        field = vcf_mod.VcfField(
+            "FORMAT", "X", "1", vcf_type, "", vcf_mod.VcfFieldSummary()
+        )
+        transformer = vcf_mod.VcfValueTransformer.factory(field, 2)
+        native = np.array(values, dtype=dtype).reshape(2, 1)
+
+        assert transformer.transform_for_encoding(native) is native
+        nt.assert_equal(
+            transformer.transform_for_encoding(native), transformer.transform(native)
+        )
+
+        undershaped = native[:, 0]
+        transformed = transformer.transform_for_encoding(undershaped)
+        assert transformed is not undershaped
+        nt.assert_equal(transformed, transformer.transform(undershaped))
+
+    @pytest.mark.parametrize(
         "array",
         [
             np.array([], dtype="i4"),

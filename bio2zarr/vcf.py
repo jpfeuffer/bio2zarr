@@ -561,6 +561,16 @@ class VcfValueTransformer:
         value = np.array(vcf_value, ndmin=self.dimension, copy=True)
         return value
 
+    def transform_for_encoding(self, vcf_value):
+        """Avoid copying native numeric arrays consumed by the row sanitizer."""
+        if (
+            isinstance(vcf_value, np.ndarray)
+            and vcf_value.dtype.kind in "iuf"
+            and vcf_value.ndim >= self.dimension
+        ):
+            return vcf_value
+        return self.transform(vcf_value)
+
     def transform_and_update_bounds(self, vcf_value):
         if vcf_value is None:
             return None
@@ -1447,6 +1457,10 @@ class IntermediateColumnarFormat(VcfSource):
 
 def variant_values(variant, metadata, *, genotypes=True):
     """Extract the same native values for ICF and row conversion."""
+    # TODO: Investigate a bounded cyvcf2/HTSlib columnar decode API; this adapter
+    # otherwise iterates Variant objects and fetches FORMAT values per record.
+    # Keep this path until an alternative preserves missing-value and phasing
+    # semantics within the existing row and batch memory bounds.
     values = {
         "CHROM": variant.CHROM,
         "POS": variant.POS,
@@ -1659,7 +1673,11 @@ class DirectVcfSource(VcfSource):
                 ):
                     raise ValueError("VCF row exceeds the no-ICF memory budget")
                 row = {
-                    name: None if value is None else transformers[name].transform(value)
+                    name: (
+                        None
+                        if value is None
+                        else transformers[name].transform_for_encoding(value)
+                    )
                     for name, value in values.items()
                 }
                 if (
